@@ -1,0 +1,4391 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+双模态检测GUI应用程序
+"""
+
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+import cv2
+import numpy as np
+from PIL import Image, ImageTk
+import threading
+import time
+import queue
+import json
+from datetime import datetime
+from pathlib import Path
+import sys
+import os
+import serial
+import struct
+import logging
+import warnings
+import subprocess
+import socket
+
+
+class RTSCapture(cv2.VideoCapture):
+    """
+    优化的RTSP流捕获类，解决延迟和花屏问题
+    通过多线程实时读取最新帧，避免OpenCV内置缓存导致的延迟
+    """
+    
+    def __init__(self, url, *args, **kwargs):
+        schemes = ["rtsp://", "rtmp://", "http://", "https://"]
+        if isinstance(url, str) and any(url.startswith(scheme) for scheme in schemes):
+            super().__init__(url, cv2.CAP_FFMPEG, *args, **kwargs)
+        else:
+            super().__init__(url, *args, **kwargs)
+        self._cur_frame = None
+        self._reading = False
+        self._frame_lock = threading.Lock()  # 添加线程锁保护
+        self.schemes = ["rtsp://", "rtmp://", "http://", "https://"]
+        self.frame_receiver = None
+        self._last_frame_time = 0
+        self._fps_counter = 0
+        self._last_fps_time = time.time()
+        self._actual_fps = 0.0
+        
+        # 配置RTSP参数以减少延迟
+        if isinstance(url, str) and any(url.startswith(scheme) for scheme in self.schemes):
+            self._reading = True
+            self._setup_rtsp_optimization()
+    
+    def _setup_rtsp_optimization(self):
+        """设置RTSP优化参数，充分利用CPU多线程解码"""
+        try:
+            import multiprocessing
+            cpu_count = multiprocessing.cpu_count()
+            print(f"🔧 检测到CPU核心数: {cpu_count}")
+            
+            # 后端已在 __init__ 中设置，此处无需重复操作
+            
+            # 设置最小缓冲区大小，避免累积延迟
+            self.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            
+            # 设置超时参数
+            self.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 15000)  # 15秒连接超时
+            self.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 8000)   # 8秒读取超时
+            
+            # 强制使用H.264解码器，避免HEVC POC错误
+            self.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('H', '2', '6', '4'))
+            
+            # 尝试设置多线程解码参数
+            try:
+                # 设置解码线程数为CPU核心数
+                self.set(cv2.CAP_PROP_FRAME_COUNT, cpu_count)  # 使用帧计数属性设置线程
+                print(f"✅ 设置解码线程数: {cpu_count}")
+            except Exception as thread_err:
+                print(f"⚠️ 无法设置解码线程数: {thread_err}")
+            
+            # 设置像素格式，优化解码性能
+            try:
+                self.set(cv2.CAP_PROP_CONVERT_RGB, 1)  # 自动转换RGB
+                print("✅ 设置像素格式优化")
+            except Exception as fmt_err:
+                print(f"⚠️ 像素格式设置失败: {fmt_err}")
+            
+            # 设置网络传输优化
+            try:
+                self.set(cv2.CAP_PROP_POS_MSEC, 0)  # 重置时间戳
+                print("✅ 网络传输优化设置完成")
+            except Exception as net_err:
+                print(f"⚠️ 网络优化失败: {net_err}")
+            
+            print("✅ RTSCapture多线程RTSP优化参数已设置")
+            
+        except Exception as e:
+            print(f"❌ RTSCapture优化参数设置失败: {e}")
+    
+    @staticmethod
+    def create(url, *schemes):
+        """创建RTSCapture实例的工厂方法"""
+        rtscap = RTSCapture(url)
+        rtscap.schemes.extend(schemes)
+        
+        if isinstance(url, str) and url.startswith(tuple(rtscap.schemes)):
+            rtscap.frame_receiver = threading.Thread(target=rtscap.recv_frame, daemon=True)
+            rtscap._reading = True
+        elif isinstance(url, int):
+            # 本地摄像头，不需要特殊处理
+            rtscap._reading = False
+        
+        return rtscap
+    
+    def isStarted(self):
+        """检查捕获是否已启动"""
+        ok = self.isOpened()
+        if ok and self._reading and self.frame_receiver:
+            ok = self.frame_receiver.is_alive()
+        return ok
+    
+    def recv_frame(self):
+        """后台线程持续读取最新帧 - 多线程优化版本"""
+        consecutive_errors = 0
+        max_errors = 15  # 增加容错次数
+        frame_skip_count = 0  # 跳帧计数
+        
+        # 设置线程优先级（Windows和Linux兼容）
+        try:
+            import os
+            if hasattr(os, 'nice'):
+                os.nice(-5)  # 提高线程优先级（Linux）
+        except:
+            pass
+        
+        print("🚀 RTSCapture多线程后台读取启动")
+        
+        while self._reading and self.isOpened():
+            try:
+                # 使用非阻塞读取策略
+                ok, frame = super().read()  # 调用父类的read方法
+                
+                if not ok or frame is None:
+                    consecutive_errors += 1
+                    if consecutive_errors >= max_errors:
+                        print(f"❌ RTSCapture连续{consecutive_errors}次读取失败，停止线程")
+                        break
+                    
+                    # 根据错误次数调整等待时间
+                    if consecutive_errors < 5:
+                        time.sleep(0.001)  # 短错误，快速重试
+                    else:
+                        time.sleep(0.005)  # 多次错误，稍长等待
+                    continue
+                
+                # 重置错误计数
+                consecutive_errors = 0
+                
+                # 快速帧质量验证，减少CPU开销
+                if self._validate_frame_fast(frame):
+                    frame_skip_count = 0  # 重置跳帧计数
+                    
+                    # 使用最小锁定时间更新帧
+                    with self._frame_lock:
+                        self._cur_frame = frame
+                        self._last_frame_time = time.time()
+                        self._fps_counter += 1
+                    
+                    # 计算实际FPS（降低计算频率）
+                    current_time = time.time()
+                    if current_time - self._last_fps_time >= 2.0:  # 每2秒计算一次
+                        self._actual_fps = self._fps_counter / (current_time - self._last_fps_time)
+                        self._fps_counter = 0
+                        self._last_fps_time = current_time
+                        
+                        # 输出多线程解码状态
+                        if self._actual_fps > 0:
+                            print(f"🎯 RTSCapture多线程解码FPS: {self._actual_fps:.1f}")
+                else:
+                    # 处理损坏帧
+                    frame_skip_count += 1
+                    if frame_skip_count > 50:  # 连续50帧损坏，可能是POC错误
+                        print(f"⚠️ 检测到连续{frame_skip_count}帧损坏，可能是POC错误，尝试重新同步...")
+                        # 快速跳过多个帧以重新同步
+                        for _ in range(5):
+                            try:
+                                super().read()
+                            except:
+                                break
+                        frame_skip_count = 0
+                
+                # 根据CPU负载动态调整延迟
+                # 多核CPU下可以更积极地读取
+                import multiprocessing
+                if multiprocessing.cpu_count() >= 8:
+                    time.sleep(0.0005)  # 8核以上，极小延迟
+                elif multiprocessing.cpu_count() >= 4:
+                    time.sleep(0.001)   # 4-7核，小延迟
+                else:
+                    time.sleep(0.002)   # 少于4核，稍大延迟
+                
+            except Exception as e:
+                consecutive_errors += 1
+                if "POC" in str(e) or "ref" in str(e):
+                    print(f"🔧 检测到POC错误，自动恢复中...")
+                    # POC错误恢复策略：快速跳过损坏帧
+                    for _ in range(10):
+                        try:
+                            super().read()  # 快速跳过损坏帧
+                        except:
+                            break
+                    consecutive_errors = max(0, consecutive_errors - 5)  # 减少错误计数
+                else:
+                    print(f"⚠️ RTSCapture帧读取异常: {e}")
+                
+                if consecutive_errors >= max_errors:
+                    print(f"❌ RTSCapture达到最大错误次数，停止线程")
+                    break
+                    
+                # 错误恢复等待
+                time.sleep(0.01 if consecutive_errors < 10 else 0.05)
+        
+        self._reading = False
+        print("🔄 RTSCapture多线程后台线程结束")
+    
+    def _validate_frame(self, frame):
+        """验证帧质量，检测花屏"""
+        if frame is None or frame.size == 0:
+            return False
+        
+        try:
+            # 检查基本尺寸
+            height, width = frame.shape[:2]
+            if height < 10 or width < 10:
+                return False
+            
+            # 检查灰度方差，过低可能是花屏或纯色
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            variance = np.var(gray)
+            
+            # 方差过低可能是花屏
+            if variance < 1.0:
+                return False
+            
+            # 检查亮度分布，避免过度曝光或全黑
+            mean_brightness = np.mean(gray)
+            if mean_brightness < 5 or mean_brightness > 250:
+                return False
+            
+            return True
+            
+        except Exception:
+            return False
+    
+    def _validate_frame_fast(self, frame):
+        """快速帧验证，减少CPU开销"""
+        if frame is None or frame.size == 0:
+            return False
+        
+        try:
+            # 只检查基本尺寸和数据完整性
+            height, width = frame.shape[:2]
+            if height < 10 or width < 10:
+                return False
+            
+            # 快速检查：采样几个像素点验证数据完整性
+            # 避免全帧处理，减少CPU负担
+            if height > 100 and width > 100:
+                # 检查4个角落的像素值
+                corners = [
+                    frame[10, 10],
+                    frame[10, width-10],
+                    frame[height-10, 10],
+                    frame[height-10, width-10]
+                ]
+                
+                # 检查角落像素是否全为0（可能的损坏帧特征）
+                all_zero = all(np.all(corner == 0) for corner in corners)
+                if all_zero:
+                    return False
+                
+                # 检查是否有极端异常值
+                all_max = all(np.all(corner == 255) for corner in corners)
+                if all_max:
+                    return False
+            
+            return True
+            
+        except Exception:
+            return False
+    
+    def read_latest_frame(self):
+        """读取最新帧（非阻塞）"""
+        if not self._reading:
+            # 非RTSP流，使用标准read方法
+            return super().read()
+        
+        with self._frame_lock:
+            if self._cur_frame is not None:
+                frame = self._cur_frame.copy()
+                return True, frame
+            else:
+                return False, None
+    
+    def read2(self):
+        """替代read方法，返回最新帧并清空缓存"""
+        if not self._reading:
+            return super().read()
+        
+        with self._frame_lock:
+            frame = self._cur_frame
+            self._cur_frame = None  # 清空缓存，确保下次读取新帧
+            return frame is not None, frame
+    
+    def start_read(self):
+        """启动帧读取"""
+        if self._reading and self.frame_receiver:
+            self.frame_receiver.start()
+            # 设置读取方法
+            self.read_latest_frame = self.read2 if self._reading else super().read
+            print("✅ RTSCapture已启动多线程读取")
+        else:
+            # 非RTSP流，使用标准读取
+            self.read_latest_frame = super().read
+            print("✅ RTSCapture使用标准读取模式")
+    
+    def stop_read(self):
+        """停止帧读取"""
+        self._reading = False
+        if self.frame_receiver and self.frame_receiver.is_alive():
+            try:
+                self.frame_receiver.join(timeout=3.0)  # 最多等待3秒
+                print("✅ RTSCapture后台线程已停止")
+            except Exception as e:
+                print(f"⚠️ RTSCapture线程停止异常: {e}")
+    
+    def get_fps(self):
+        """获取实际FPS"""
+        return self._actual_fps
+    
+    def get_frame_age(self):
+        """获取当前帧的年龄（秒）"""
+        if self._last_frame_time > 0:
+            return time.time() - self._last_frame_time
+        return float('inf')
+    
+    def release(self):
+        """释放资源"""
+        self.stop_read()
+        super().release()
+
+
+# 导入批处理配置
+try:
+    from batch_config import get_config, print_config
+    BATCH_CONFIG = get_config("ultra_fast")  # 使用ultra_fast预设
+    print("✅ 已加载ultra_fast批处理配置")
+    print_config(BATCH_CONFIG)
+except ImportError:
+    # 优化的批处理配置，专门针对低帧率问题
+    BATCH_CONFIG = {
+        "batch_size": 8,         # 减小批处理大小，提高响应速度
+        "max_batch_size": 12,    # 降低最大批处理大小
+        "batch_interval": 0.01,  # 减少间隔时间
+        "max_wait_time": 0.03,   # 减少等待时间
+        "force_timeout": 0.05,   # 减少强制超时
+        "min_batch_trigger": 4,  # 降低最小触发阈值
+        "enable_fast_mode": True,
+        "skip_gpu_monitoring": True,
+        "silent_errors": True,
+    }
+    print("⚠️ 使用优化的帧率提升批处理配置")
+
+# 抑制OpenCV和FFmpeg的警告信息
+warnings.filterwarnings("ignore", category=UserWarning)
+
+# 多线程解码优化配置
+import multiprocessing
+cpu_count = multiprocessing.cpu_count()
+print(f"🔧 系统CPU核心数: {cpu_count}")
+
+# 配置FFmpeg多线程解码参数，解决POC错误
+ffmpeg_options = [
+    'rtsp_transport;tcp',  # 使用TCP传输
+    f'threads;{cpu_count}',  # 设置解码线程数等于CPU核心数
+    'thread_type;decode',  # 指定为解码线程
+    'lowres;0',  # 不降低分辨率
+    'skip_frame;0',  # 不跳帧
+    'skip_idct;0',  # 不跳过IDCT
+    'skip_loop_filter;0',  # 不跳过环路滤波
+    'fflags;+discardcorrupt',  # 丢弃损坏的帧
+    'flags;+low_delay',  # 启用低延迟模式
+    'probesize;32',  # 减小探测大小，加快连接
+    'analyzeduration;1000000',  # 分析时长1秒
+]
+os.environ['OPENCV_FFMPEG_CAPTURE_OPTIONS'] = '|'.join(ffmpeg_options)
+
+# 强制使用软件多线程解码，避免HEVC硬件解码问题
+os.environ['OPENCV_FFMPEG_DISABLE_HEVC_HWACCEL'] = '1'
+
+# 48GB显卡专用优化配置 - 彻底解决POC错误
+os.environ['OPENCV_FFMPEG_DISABLE_HEVC'] = '1'
+os.environ['OPENCV_FFMPEG_DISABLE_H265'] = '1'
+os.environ['OPENCV_FFMPEG_BLACKLIST_CODECS'] = 'hevc,h265'
+os.environ['OPENCV_FFMPEG_PREFERRED_CODECS'] = 'h264,mjpeg'
+os.environ['OPENCV_FFMPEG_FORCE_H264'] = '1'
+# 新增：强制跳过错误帧，避免POC错误导致的解码阻塞
+os.environ['OPENCV_FFMPEG_ERROR_RECOVERY'] = '1'
+os.environ['OPENCV_FFMPEG_SKIP_FRAME_ON_ERROR'] = '1'
+
+# 抑制FFmpeg的HEVC错误日志
+
+import platform
+
+def suppress_ffmpeg_logs():
+    """抑制FFmpeg的日志输出，专门处理POC错误信息"""
+    if platform.system() == "Windows":
+        # 在Windows上设置环境变量
+        os.environ['OPENCV_FFMPEG_LOGLEVEL'] = 'quiet'
+        os.environ['FFMPEG_LOGLEVEL'] = 'quiet'
+        os.environ['AV_LOG_FORCE_NOCOLOR'] = '1'
+        # 专门抑制POC错误
+        os.environ['OPENCV_FFMPEG_SUPPRESS_POC_ERRORS'] = '1'
+    
+    # 设置OpenCV的日志级别
+    try:
+        cv2.setLogLevel(cv2.LOG_LEVEL_SILENT)  # 完全静音
+    except:
+        try:
+            cv2.setLogLevel(cv2.LOG_LEVEL_ERROR)
+        except:
+            pass
+    
+    # 强化HEVC错误抑制
+    try:
+        # 重定向stderr到null设备
+        import contextlib
+        import io
+        import sys
+        
+        # 创建一个上下文管理器来抑制stderr（已移除未使用的函数）
+        
+        # 增强的HEVC错误抑制，专门处理POC错误
+        if platform.system() == "Windows":
+            os.environ['OPENCV_FFMPEG_CAPTURE_OPTIONS'] = 'rtsp_transport;tcp|loglevel;quiet|protocol_whitelist;file,udp,rtp,tcp|fflags;+genpts+discardcorrupt'
+            # 完全禁用HEVC相关的错误输出
+            os.environ['OPENCV_FFMPEG_STDERR_REDIRECT'] = '1'
+            # 新增：自动丢弃损坏的帧
+            os.environ['OPENCV_FFMPEG_DISCARD_CORRUPT'] = '1'
+    except:
+        pass
+
+# 调用日志抑制函数
+suppress_ffmpeg_logs()
+
+# 确保本地ultralytics优先级最高
+current_dir = Path(__file__).parent.parent
+ultralytics_path = str(current_dir)
+
+# 将本地路径插入到sys.path的最前面
+if ultralytics_path not in sys.path:
+    sys.path.insert(0, ultralytics_path)
+
+# 强制重新导入ultralytics相关模块
+if 'ultralytics' in sys.modules:
+    modules_to_remove = [k for k in sys.modules.keys() if k.startswith('ultralytics')]
+    for module in modules_to_remove:
+        del sys.modules[module]
+
+# Kafka相关导入
+try:
+    from kafka import KafkaProducer
+    KAFKA_AVAILABLE = True
+except ImportError:
+    KAFKA_AVAILABLE = False
+    print("警告: Kafka库未安装，预警消息将无法发送到消息队列")
+
+try:
+    from predict_dual_modal import DualModalPredictor
+    print("成功导入 DualModalPredictor")
+except ImportError as e:
+    print(f"导入失败: {e}")
+    sys.exit(1)
+
+# 雷达相关常量
+RADAR_HEADER = b'\x55\xAA'
+CMD_START_REPORTING = 0x20
+CMD_STOP_REPORTING = 0x21
+CMD_TARGET_DATA = 0x42
+TARGET_SIZE_BYTES = 9
+SPEED_THRESHOLD = 3.0  # 速度阈值 3m/s
+
+
+class CameraAIController:
+    """Pilot640DSL-RJ45 双光车载热像仪 AI功能控制器（根据说明书协议实现）"""
+    
+    def __init__(self, camera_ip="192.168.1.100", camera_port=8067, debug=True):
+        self.camera_ip = camera_ip
+        self.camera_port = camera_port
+        self.timeout = 10  # 增加到10秒超时，给摄像头更多处理时间
+        self.debug = debug  # 调试模式
+    
+    def calculate_checksum(self, cmd_type, data_length, data_body):
+        """计算校验位：仅对命令类型、数据长度和数据主体计算二进制1的个数"""
+        total_ones = 0
+        
+        # 命令类型
+        total_ones += bin(cmd_type).count('1')
+        
+        # 数据有效长度
+        total_ones += bin(data_length).count('1')
+        
+        # 数据主体
+        if isinstance(data_body, list):
+            for byte in data_body:
+                total_ones += bin(byte).count('1')
+        else:
+            total_ones += bin(data_body).count('1')
+        
+        return total_ones & 0xFFFF  # 返回16位值
+    
+    def build_ai_command(self, enable_ai=False):
+        """
+        构建AI控制命令（根据最新协议说明）
+        完整格式：A0 0F 02 01 01 00 00 00 00 00 00 03 00 E0 A0 (15字节)
+        
+        Args:
+            enable_ai (bool): True=开启AI, False=关闭AI
+            
+        Returns:
+            bytes: 完整的命令字节序列
+        """
+        # 根据协议说明构建完整的15字节命令
+        if enable_ai:
+            # 开启AI命令：A0 0F 02 01 00 00 00 00 00 00 00 02 00 E0 A0
+            # 校验位计算：02(1个1) + 01(1个1) + 00(0个1) = 2个1 → 0x0002
+            command = bytes.fromhex("A0 0F 02 01 00 00 00 00 00 00 00 02 00 E0 A0")
+            action = "开启"
+        else:
+            # 关闭AI命令：A0 0F 02 01 01 00 00 00 00 00 00 03 00 E0 A0
+            # 校验位计算：02(1个1) + 01(1个1) + 01(1个1) = 3个1 → 0x0003
+            command = bytes.fromhex("A0 0F 02 01 01 00 00 00 00 00 00 03 00 E0 A0")
+            action = "关闭"
+        
+        if self.debug:
+            print(f"🔧 构建{action}AI命令 (15字节完整格式):")
+            print(f"   命令头: A0 0F")
+            print(f"   命令类型: 02 (设置AI状态)")
+            print(f"   数据长度: 01")
+            print(f"   AI状态: {'00 (开启)' if enable_ai else '01 (关闭)'}")
+            print(f"   填充字节: 00 00 00 00 00 00")
+            print(f"   校验位: {'02 00' if enable_ai else '03 00'} (小端序)")
+            print(f"   命令尾: E0 A0")
+            print(f"   完整命令: {command.hex().upper()}")
+        
+        return command
+    
+    def send_command(self, command, description="", expect_response=True):
+        """
+        发送命令到摄像头
+        
+        Args:
+            command (bytes): 要发送的命令
+            description (str): 命令描述
+            expect_response (bool): 是否等待并解析响应
+            
+        Returns:
+            tuple: (success, response_data, error_message)
+        """
+        try:
+            # 建立TCP连接
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(self.timeout)
+            
+            print(f"🔗 正在连接摄像头 {self.camera_ip}:{self.camera_port}")
+            sock.connect((self.camera_ip, self.camera_port))
+            
+            # 发送命令
+            sock.send(command)
+            print(f"📤 {description}命令已发送: {command.hex().upper()}")
+            
+            if not expect_response:
+                print(f"✅ {description}操作已发送 (不等待响应)")
+                sock.close()
+                return True, None, None  # 假设成功
+            
+            # 等待摄像头处理命令
+            import time
+            time.sleep(0.5)  # 等待500ms让摄像头处理命令
+            
+            # 接收响应
+            response = sock.recv(1024)
+            print(f"📥 摄像头响应: {response.hex().upper()}")
+            
+            # 如果响应为空，再等待一下重试
+            if len(response) == 0:
+                print("⏳ 响应为空，等待重试...")
+                time.sleep(1.0)
+                response = sock.recv(1024)
+                print(f"📥 重试响应: {response.hex().upper()}")
+            
+            # 解析响应状态（根据说明书命令返回格式）
+            if len(response) >= 4:
+                # 响应格式：FF F0 [状态码2字节小端序] [命令类型] [数据主体] ... AA A0
+                if response[0] == 0xFF and response[1] == 0xF0:
+                    status_code = int.from_bytes(response[2:4], byteorder='little')
+                    
+                    # 验证返回尾部（应该是 AA A0）
+                    if len(response) >= 2:
+                        tail = response[-2:]
+                        if tail[0] != 0xAA or tail[1] != 0xA0:
+                            print(f"⚠️ 响应尾部异常: {tail.hex().upper()}, 期望: AA A0")
+                    
+                    # 状态码含义（参考说明书错误码表）
+                    status_messages = {
+                        0x0000: "操作成功",
+                        0x0001: "命令格式错误",
+                        0x0002: "校验位错误", 
+                        0x0003: "命令类型不支持",
+                        0x0004: "数据长度错误",
+                        0x0005: "参数值超出范围",
+                        0x0006: "设备忙碌",
+                        0x0007: "操作失败"
+                    }
+                    
+                    if status_code == 0x0000:
+                        print(f"✅ {description}操作成功")
+                        return True, response, None
+                    else:
+                        status_msg = status_messages.get(status_code, f"未知错误码: 0x{status_code:04X}")
+                        error_msg = f"{description}操作失败 - {status_msg}"
+                        print(f"❌ {error_msg}")
+                        return False, response, error_msg
+                else:
+                    error_msg = f"无效的响应头: {response[:2].hex().upper()}, 期望: FF F0"
+                    print(f"⚠️ {error_msg}")
+                    return False, response, error_msg
+            else:
+                error_msg = f"响应数据太短: {len(response)} 字节，期望至少4字节"
+                print(f"⚠️ {error_msg}")
+                return False, response, error_msg
+                
+        except socket.timeout:
+            error_msg = f"连接超时 ({self.timeout}秒)"
+            print(f"⏰ {error_msg}")
+            print(f"🔍 网络诊断: 请检查摄像头IP({self.camera_ip})和端口({self.camera_port})是否正确")
+            print(f"💡 建议: 1) 确认摄像头已开机 2) 检查网络连通性 3) 验证IP地址")
+            return False, None, error_msg
+        except ConnectionRefusedError:
+            error_msg = f"连接被拒绝，请检查摄像头IP和端口"
+            print(f"🚫 {error_msg}")
+            print(f"💡 可能原因: 1) 端口{self.camera_port}未开放 2) 摄像头控制服务未启动")
+            return False, None, error_msg
+        except OSError as e:
+            if "No route to host" in str(e):
+                error_msg = f"网络不可达: {self.camera_ip}"
+                print(f"🌐 {error_msg}")
+                print(f"💡 请检查: 1) 网络连接 2) IP地址是否在同一网段")
+            else:
+                error_msg = f"网络错误: {e}"
+                print(f"🔌 {error_msg}")
+            return False, None, error_msg
+        except Exception as e:
+            error_msg = f"发送命令时出错: {e}"
+            print(f"❌ {error_msg}")
+            return False, None, error_msg
+        finally:
+            try:
+                sock.close()
+            except:
+                pass
+    
+    def disable_ai(self):
+        """关闭摄像头AI功能"""
+        command = self.build_ai_command(enable_ai=False)
+        # 不等待响应，避免超时问题
+        return self.send_command(command, "关闭AI", expect_response=False)
+    
+    def enable_ai(self):
+        """开启摄像头AI功能"""
+        command = self.build_ai_command(enable_ai=True)
+        # 不等待响应，避免超时问题
+        return self.send_command(command, "开启AI", expect_response=False)
+    
+    def set_work_mode(self, mode=1):
+        """
+        设置工作模式（根据协议说明）
+        
+        Args:
+            mode (int): 0=自动切换, 1=双路输出(默认), 2=融合模式
+            
+        Returns:
+            tuple: (success, response_data, error_message)
+        """
+        # 构建15字节工作模式命令，参考AI命令格式
+        mode_value = mode & 0xFF
+        
+        # 计算校验位：00(0个1) + 01(1个1) + mode_value的1的个数
+        checksum = 1 + bin(mode_value).count('1')  # 命令类型00 + 数据长度01 + 模式值
+        
+        # 构建完整命令
+        command_hex = f"A0 0F 00 01 {mode_value:02X} 00 00 00 00 00 00 {checksum:02X} 00 E0 A0"
+        command = bytes.fromhex(command_hex)
+        
+        mode_names = {0: "自动切换", 1: "双路输出", 2: "融合模式"}
+        mode_desc = mode_names.get(mode, f"模式{mode}")
+        
+        if self.debug:
+            print(f"🔧 构建设置工作模式命令 ({mode_desc}):")
+            print(f"   完整命令: {command.hex().upper()}")
+        
+        return self.send_command(command, f"设置工作模式为{mode_desc}", expect_response=False)
+    
+    # get_work_mode函数已删除（未使用）
+    
+    def test_network_connection(self):
+        """测试网络连通性"""
+        try:
+            print(f"🔍 测试网络连通性到 {self.camera_ip}:{self.camera_port}")
+            
+            # 尝试基本的TCP连接测试
+            test_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            test_sock.settimeout(5)  # 5秒超时用于测试
+            
+            result = test_sock.connect_ex((self.camera_ip, self.camera_port))
+            test_sock.close()
+            
+            if result == 0:
+                print(f"✅ 网络连接正常，端口{self.camera_port}可达")
+                return True
+            else:
+                print(f"❌ 无法连接到端口{self.camera_port}，错误代码: {result}")
+                return False
+                
+        except Exception as e:
+            print(f"❌ 网络测试异常: {e}")
+            return False
+    
+    def ping_camera(self):
+        """Ping测试摄像头IP"""
+        try:
+            import subprocess
+            import platform
+            
+            # 根据操作系统选择ping命令
+            if platform.system().lower() == "windows":
+                cmd = ["ping", "-n", "3", self.camera_ip]
+            else:
+                cmd = ["ping", "-c", "3", self.camera_ip]
+            
+            print(f"🏓 Ping测试 {self.camera_ip}...")
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            
+            if result.returncode == 0:
+                print(f"✅ Ping成功，摄像头网络可达")
+                return True
+            else:
+                print(f"❌ Ping失败，摄像头可能不在线或网络不通")
+                return False
+                
+        except subprocess.TimeoutExpired:
+            print(f"⏰ Ping超时")
+            return False
+        except Exception as e:
+            print(f"❌ Ping测试异常: {e}")
+            return False
+    
+    def get_ai_status(self):
+        """获取AI状态（根据说明书完整格式）"""
+        # 根据说明书，获取AI状态命令格式：A0 0F 05 00 00 00 00 00 00 00 00 02 00 E0 A0
+        command = bytes.fromhex("A0 0F 05 00 00 00 00 00 00 00 00 02 00 E0 A0")
+        
+        if self.debug:
+            print(f"🔧 构建获取AI状态命令:")
+            print(f"   完整命令: {command.hex().upper()}")
+        
+        success, response, error = self.send_command(command, "获取AI状态")
+        
+        if success and response and len(response) >= 6:
+            # 解析响应格式：FF F0 [状态码] [命令类型] [数据主体] ...
+            if response[0] == 0xFF and response[1] == 0xF0:
+                status_code = int.from_bytes(response[2:4], byteorder='little')
+                if status_code == 0x0000:
+                    # 查找AI状态数据（在响应中的位置可能不同）
+                    if len(response) >= 7:
+                        ai_status = response[6]  # 根据说明书示例，AI状态在第7个字节
+                        if self.debug:
+                            print(f"📊 AI状态解析: {ai_status:02X} ({'关闭' if ai_status == 0x01 else '开启'})")
+                        return success, ai_status == 0x01, error  # True表示已关闭
+        
+        return success, None, error
+    
+    def verify_ai_status_after_set(self, expected_disabled=True, max_retries=3):
+        """
+        设置AI状态后验证是否成功
+        
+        Args:
+            expected_disabled (bool): 期望的AI状态，True表示期望关闭
+            max_retries (int): 最大重试次数
+            
+        Returns:
+            bool: 验证是否成功
+        """
+        import time
+        
+        for retry in range(max_retries):
+            try:
+                # 等待摄像头处理完设置命令
+                time.sleep(2.0)  # 等待2秒
+                
+                print(f"🔍 验证AI状态 (第{retry+1}次尝试)...")
+                success, ai_disabled, error = self.get_ai_status()
+                
+                if success and ai_disabled is not None:
+                    if ai_disabled == expected_disabled:
+                        status_desc = "关闭" if ai_disabled else "开启"
+                        print(f"✅ AI状态验证成功: {status_desc}")
+                        return True
+                    else:
+                        actual_desc = "关闭" if ai_disabled else "开启"
+                        expected_desc = "关闭" if expected_disabled else "开启"
+                        print(f"⚠️ AI状态不符合预期: 实际={actual_desc}, 期望={expected_desc}")
+                else:
+                    print(f"⚠️ 无法获取AI状态: {error}")
+                
+                if retry < max_retries - 1:
+                    print(f"⏳ 等待重试...")
+                    time.sleep(1.0)
+                    
+            except Exception as e:
+                print(f"❌ 验证AI状态异常: {e}")
+        
+        print(f"❌ AI状态验证失败，已重试{max_retries}次")
+        return False
+
+
+class RadarProcessor:
+    """雷达数据处理器"""
+    
+    def __init__(self, port='COM3', baudrate=115200):
+        self.port = port
+        self.baudrate = baudrate
+        self.ser = None
+        self.is_running = False
+        self.buffer = b''
+        self.data_queue = queue.Queue()
+        self.lock = threading.Lock()
+        
+    def calculate_checksum(self, data_bytes):
+        return sum(data_bytes) & 0xFF
+    
+    def build_command(self, cmd_id, payload=b''):
+        length = len(payload) + 1  # 加上 cmd_id 自身
+        frame = RADAR_HEADER
+        frame += struct.pack('<H', length)  # 数据长度
+        frame += struct.pack('B', cmd_id)
+        frame += payload
+        checksum = self.calculate_checksum(frame[2:])
+        frame += struct.pack('B', checksum)
+        return frame
+    
+    def connect(self):
+        """连接雷达设备"""
+        try:
+            self.ser = serial.Serial(self.port, self.baudrate, timeout=0.5)
+            time.sleep(1)
+            self.is_running = True
+            
+            # 发送开始上报命令
+            cmd = self.build_command(CMD_START_REPORTING)
+            self.ser.write(cmd)
+            print(f"雷达已连接到 {self.port}")
+            
+            # 启动读取线程
+            self.read_thread = threading.Thread(target=self.read_loop, daemon=True)
+            self.read_thread.start()
+            return True
+            
+        except Exception as e:
+            print(f"雷达连接失败: {e}")
+            return False
+    
+    def disconnect(self):
+        """断开雷达连接"""
+        self.is_running = False
+        if self.ser and self.ser.is_open:
+            try:
+                # 发送停止上报命令
+                cmd = self.build_command(CMD_STOP_REPORTING)
+                self.ser.write(cmd)
+            except:
+                pass
+            self.ser.close()
+            print("雷达已断开")
+    
+    def parse_targets(self, data):
+        """解析目标数据"""
+        targets = []
+        offset = 0
+        
+        while offset + TARGET_SIZE_BYTES <= len(data):
+            tid = data[offset]  # 1 byte
+            dist = struct.unpack('<H', data[offset+1:offset+3])[0] * 0.01
+            speed = struct.unpack('<h', data[offset+3:offset+5])[0] * 0.01
+            angle = struct.unpack('<h', data[offset+5:offset+7])[0] * 0.01
+            snr = struct.unpack('<H', data[offset+7:offset+9])[0] * 0.01
+            
+            targets.append({
+                "目标编号": tid,
+                "距离(m)": dist,
+                "速度(m/s)": speed,
+                "方位角(°)": angle,
+                "SNR(dB)": snr,
+                "超速": abs(speed) > SPEED_THRESHOLD
+            })
+            offset += TARGET_SIZE_BYTES
+        
+        return targets
+    
+    def read_loop(self):
+        """雷达数据读取循环"""
+        while self.is_running:
+            try:
+                if self.ser.in_waiting > 0:
+                    with self.lock:
+                        self.buffer += self.ser.read(self.ser.in_waiting or 1)
+                
+                with self.lock:
+                    while True:
+                        start = self.buffer.find(RADAR_HEADER)
+                        if start == -1 or len(self.buffer) < start + 5:
+                            break
+                        
+                        length = struct.unpack('<H', self.buffer[start+2:start+4])[0]
+                        total_len = 2 + 2 + length + 1  # header + length + data + checksum
+                        
+                        if len(self.buffer) < start + total_len:
+                            break
+                        
+                        frame = self.buffer[start:start + total_len]
+                        cmd_id = frame[4]
+                        payload = frame[5:-1]
+                        checksum = frame[-1]
+                        
+                        if self.calculate_checksum(frame[2:-1]) != checksum:
+                            print("雷达数据校验失败")
+                            self.buffer = self.buffer[start + 1:]
+                            continue
+                        
+                        if cmd_id == CMD_TARGET_DATA:
+                            targets = self.parse_targets(payload)
+                            if targets:
+                                self.data_queue.put({
+                                    'timestamp': time.time(),
+                                    'targets': targets
+                                })
+                        
+                        self.buffer = self.buffer[start + total_len:]
+                        
+            except Exception as e:
+                print(f"雷达读取错误: {e}")
+                time.sleep(0.1)
+    
+    def get_latest_data(self):
+        """获取最新的雷达数据"""
+        latest_data = None
+        try:
+            # 获取队列中所有数据，保留最新的
+            while not self.data_queue.empty():
+                latest_data = self.data_queue.get_nowait()
+        except:
+            pass
+        return latest_data
+
+
+class KafkaAlertProducer:
+    """Kafka预警消息生产者"""
+    
+    def __init__(self, bootstrap_servers='100.16.99.80:9092', topic='security_alerts'):
+        self.topic = topic
+        self.bootstrap_servers = bootstrap_servers
+        self.producer = None
+        self.is_connected = False
+        
+        if not KAFKA_AVAILABLE:
+            print("Kafka库未安装，跳过Kafka初始化")
+            return
+            
+        try:
+            # SASL认证配置 - 使用正确的SCRAM配置
+            sasl_config = {
+                'bootstrap_servers': bootstrap_servers,
+                'value_serializer': lambda v: json.dumps(v, ensure_ascii=False, default=str).encode('utf-8'),
+                'key_serializer': lambda k: str(k).encode('utf-8') if k else None,
+                'acks': 'all',
+                'retries': 3,
+                'batch_size': 16384,
+                'linger_ms': 10,
+                'buffer_memory': 33554432,
+                # 连接和超时配置
+                'request_timeout_ms': 30000,
+                'connections_max_idle_ms': 300000,
+                'metadata_max_age_ms': 300000,
+                # SASL SCRAM-SHA-256认证参数（完整配置）
+                'security_protocol': 'SASL_PLAINTEXT',
+                'sasl_mechanism': 'SCRAM-SHA-256',
+                'sasl_plain_username': 'admin',
+                'sasl_plain_password': 'admin@2021',
+                # 等价于Java的sasl_jaas_config配置
+                'sasl_kerberos_service_name': None,  # 明确禁用Kerberos
+            }
+            
+            self.producer = KafkaProducer(**sasl_config)
+            self.is_connected = True
+            print(f"Kafka生产者已连接到 {bootstrap_servers}, 主题: {topic} (SCRAM-SHA-256认证)")
+        except Exception as e:
+            print(f"Kafka连接失败: {e}")
+            self.is_connected = False
+    
+    def send_alert(self, alert_data):
+        """发送预警消息"""
+        if not self.is_connected or not self.producer:
+            return False
+        
+        try:
+            # 添加时间戳
+            alert_data['timestamp'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            alert_data['system_version'] = '1.0.0'
+            
+            # 发送消息
+            future = self.producer.send(
+                self.topic,
+                value=alert_data,
+                key=f"alert_{alert_data.get('camera_id', 'unknown')}_{int(time.time())}"
+            )
+            
+            # 等待发送结果
+            record_metadata = future.get(timeout=10)
+            print(f"✅ Kafka消息已发送到主题 {record_metadata.topic}, 分区 {record_metadata.partition}")
+            return True
+            
+        except Exception as e:
+            print(f"❌ Kafka发送失败: {e}")
+            return False
+    
+    def close(self):
+        """关闭Kafka生产者"""
+        if self.producer:
+            self.producer.close()
+            print("Kafka生产者已关闭")
+
+
+class DualModalDetectionGUI:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("三模态实时检测系统 - 带雷达速度监测")
+        self.root.geometry("1120x800")  # 保持原比例(1.4:1)但降低分辨率
+        
+        # 检测相关变量
+        self.predictor = None
+        self.is_running = False
+        self.rgb_cap = None
+        self.ir_cap = None
+        self.device = "cpu"  # 添加设备属性
+        
+        # 雷达相关
+        self.radar_processor = None
+        self.radar_enabled = False
+        self.last_radar_data = None
+        
+        # Kafka相关
+        self.kafka_producer = None
+        self.last_alert_time = {}  # 预警冷却时间管理
+        self.alert_cooldown = 5.0  # 5秒冷却时间
+        
+        # GUI变量
+        self.buffer_time_var = tk.IntVar()
+        
+        # 摄像头AI控制相关
+        self.camera_ai_controller = None
+        self.camera_ai_disabled = False
+        
+        # 统计信息
+        self.stats = {
+            'frame_count': 0,
+            'detection_count': 0,
+            'alert_count': 0,
+            'radar_alert_count': 0,
+            'kafka_sent': 0,
+            'kafka_failed': 0,
+            'start_time': 0
+        }
+        
+        # 帧率统计
+        self.rgb_fps = 0.0
+        self.ir_fps = 0.0
+        self.processed_fps = 0.0
+        
+        # HEVC错误计数器
+        self.hevc_error_count = 0
+        
+        # 创建GUI界面
+        self.create_widgets()
+        
+        # 设置默认值
+        self.model_path_var.set("../runs/detect/train/weights/best.pt")
+        self.rtsp_mode_var.set("可见光")
+        self.rtsp_base_ip_var.set("192.168.1.100")
+        self.rgb_source_var.set("0")
+        self.ir_source_var.set("0")
+        self.rtsp_transport_var.set("TCP (推荐)")
+        self.confidence_var.set(0.5)
+        self.kafka_servers_var.set("100.16.99.80:9092")
+        self.kafka_topic_var.set("security_alerts")
+        self.camera_id_var.set("camera_001")
+        self.camera_location_var.set("主入口")
+        self.radar_port_var.set("COM3")
+        self.radar_enabled_var.set(True)
+        self.speed_threshold_var.set(3.0)
+        self.buffer_time_var.set(100) # 默认100ms
+        
+        # 应用默认RTSP设置
+        self.apply_rtsp_settings()
+        
+    def create_widgets(self):
+        """创建GUI组件"""
+        # 主框架
+        main_frame = ttk.Frame(self.root, padding="10")
+        main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        
+        # 配置网格权重
+        self.root.columnconfigure(0, weight=1)
+        self.root.rowconfigure(0, weight=1)
+        main_frame.columnconfigure(0, weight=1)
+        main_frame.rowconfigure(2, weight=1)  # 显示区域占据主要空间
+        
+        # 顶部页面选择区域
+        page_frame = ttk.Frame(main_frame)
+        page_frame.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
+        
+        # 页面选择按钮
+        self.page_var = tk.StringVar()
+        self.page_var.set("main")  # 默认主页面
+        
+        ttk.Label(page_frame, text="页面选择:", font=("Arial", 10, "bold")).pack(side=tk.LEFT, padx=(0, 10))
+        
+        self.main_page_btn = ttk.Button(page_frame, text="🏠 主页面", 
+                                       command=lambda: self.switch_page("main"))
+        self.main_page_btn.pack(side=tk.LEFT, padx=(0, 5))
+        
+        self.test_page_btn = ttk.Button(page_frame, text="🧪 测试页面", 
+                                       command=lambda: self.switch_page("test"))
+        self.test_page_btn.pack(side=tk.LEFT, padx=(0, 5))
+        
+        # 当前页面指示器
+        self.page_indicator = ttk.Label(page_frame, text="当前：主页面", 
+                                       foreground="blue", font=("Arial", 9, "bold"))
+        self.page_indicator.pack(side=tk.LEFT, padx=(20, 0))
+        
+        # 系统状态简要显示
+        status_info_frame = ttk.Frame(page_frame)
+        status_info_frame.pack(side=tk.RIGHT)
+        
+        self.quick_status_var = tk.StringVar()
+        self.quick_status_var.set("就绪")
+        ttk.Label(status_info_frame, text="状态:", font=("Arial", 9)).pack(side=tk.LEFT)
+        self.quick_status_label = ttk.Label(status_info_frame, textvariable=self.quick_status_var, 
+                                           foreground="green", font=("Arial", 9, "bold"))
+        self.quick_status_label.pack(side=tk.LEFT, padx=(5, 0))
+        
+        # 配置容器 - 用于切换不同页面的内容
+        self.config_container = ttk.Frame(main_frame)
+        self.config_container.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
+        self.config_container.columnconfigure(0, weight=1)
+        
+        # 创建主页面和测试页面的内容
+        self.create_main_page()
+        self.create_test_page()
+        
+        # 显示区域和控制区域（两个页面共享）
+        self.create_shared_areas(main_frame)
+        
+        # 初始显示主页面
+        self.switch_page("main")
+    
+    def create_main_page(self):
+        """创建主页面内容 - 核心检测功能"""
+        self.main_page_frame = ttk.Frame(self.config_container)
+        
+        # 1. 检测配置区域（精简版）
+        config_frame = ttk.LabelFrame(self.main_page_frame, text="🎯 检测配置", padding="5")
+        config_frame.grid(row=0, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 5))
+        
+        # 模型路径
+        ttk.Label(config_frame, text="模型路径:").grid(row=0, column=0, sticky=tk.W, padx=(0, 5))
+        self.model_path_var = tk.StringVar()
+        ttk.Entry(config_frame, textvariable=self.model_path_var, width=40).grid(row=0, column=1, sticky=(tk.W, tk.E), padx=(0, 5))  # 调整宽度
+        ttk.Button(config_frame, text="浏览", command=self.browse_model).grid(row=0, column=2)
+        
+        # RTSP流配置（简化）
+        ttk.Label(config_frame, text="RTSP模式:").grid(row=1, column=0, sticky=tk.W, padx=(0, 5))
+        self.rtsp_mode_var = tk.StringVar()
+        rtsp_mode_combo = ttk.Combobox(config_frame, textvariable=self.rtsp_mode_var, 
+                                      values=["可见光", "融合", "自动", "红外", "自定义"], 
+                                      state="readonly", width=20)
+        rtsp_mode_combo.grid(row=1, column=1, sticky=tk.W, padx=(0, 5))
+        rtsp_mode_combo.bind('<<ComboboxSelected>>', self.on_rtsp_mode_changed)
+        ttk.Button(config_frame, text="应用", command=self.apply_rtsp_settings).grid(row=1, column=2)
+        
+        # RTSP基础IP
+        ttk.Label(config_frame, text="RTSP基础IP:").grid(row=2, column=0, sticky=tk.W, padx=(0, 5))
+        self.rtsp_base_ip_var = tk.StringVar()
+        ttk.Entry(config_frame, textvariable=self.rtsp_base_ip_var, width=30).grid(row=2, column=1, sticky=tk.W, padx=(0, 5))
+        
+        # 置信度
+        ttk.Label(config_frame, text="置信度:").grid(row=3, column=0, sticky=tk.W, padx=(0, 5))
+        self.confidence_var = tk.DoubleVar()
+        conf_frame = ttk.Frame(config_frame)
+        conf_frame.grid(row=3, column=1, sticky=tk.W, padx=(0, 5))
+        ttk.Scale(conf_frame, from_=0.1, to=1.0, variable=self.confidence_var, orient=tk.HORIZONTAL, length=150).pack(side=tk.LEFT)
+        self.confidence_label = ttk.Label(conf_frame, text="0.5")
+        self.confidence_label.pack(side=tk.LEFT, padx=(5, 0))
+        self.confidence_var.trace('w', self.update_confidence_label)
+        
+        # 连接状态显示
+        ttk.Label(config_frame, text="连接状态:").grid(row=4, column=0, sticky=tk.W, padx=(0, 5))
+        self.connection_status_var = tk.StringVar()
+        self.connection_status_var.set("未连接")
+        self.connection_status_label = ttk.Label(config_frame, textvariable=self.connection_status_var, foreground="red")
+        self.connection_status_label.grid(row=4, column=1, sticky=tk.W, padx=(0, 5))
+        
+        config_frame.columnconfigure(1, weight=1)
+        
+        # 2. Kafka配置区域（精简版）
+        kafka_frame = ttk.LabelFrame(self.main_page_frame, text="📡 Kafka预警配置", padding="5")
+        kafka_frame.grid(row=1, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 5))
+        
+        # Kafka服务器和主题（一行显示）
+        ttk.Label(kafka_frame, text="服务器:").grid(row=0, column=0, sticky=tk.W, padx=(0, 5))
+        self.kafka_servers_var = tk.StringVar()
+        ttk.Entry(kafka_frame, textvariable=self.kafka_servers_var, width=25).grid(row=0, column=1, sticky=tk.W, padx=(0, 5))
+        
+        ttk.Label(kafka_frame, text="主题:").grid(row=0, column=2, sticky=tk.W, padx=(10, 5))
+        self.kafka_topic_var = tk.StringVar()
+        ttk.Entry(kafka_frame, textvariable=self.kafka_topic_var, width=20).grid(row=0, column=3, sticky=tk.W, padx=(0, 5))
+        
+        # 摄像头信息（一行显示）
+        ttk.Label(kafka_frame, text="摄像头ID:").grid(row=1, column=0, sticky=tk.W, padx=(0, 5))
+        self.camera_id_var = tk.StringVar()
+        ttk.Entry(kafka_frame, textvariable=self.camera_id_var, width=25).grid(row=1, column=1, sticky=tk.W, padx=(0, 5))
+        
+        ttk.Label(kafka_frame, text="位置:").grid(row=1, column=2, sticky=tk.W, padx=(10, 5))
+        self.camera_location_var = tk.StringVar()
+        ttk.Entry(kafka_frame, textvariable=self.camera_location_var, width=20).grid(row=1, column=3, sticky=tk.W, padx=(0, 5))
+        
+        # Kafka状态
+        ttk.Label(kafka_frame, text="Kafka状态:").grid(row=2, column=0, sticky=tk.W, padx=(0, 5))
+        self.kafka_status_var = tk.StringVar()
+        self.kafka_status_var.set("未连接")
+        self.kafka_status_label = ttk.Label(kafka_frame, textvariable=self.kafka_status_var, foreground="red")
+        self.kafka_status_label.grid(row=2, column=1, sticky=tk.W, padx=(0, 5))
+        
+        kafka_frame.columnconfigure(1, weight=1)
+        kafka_frame.columnconfigure(3, weight=1)
+        
+        # 3. 雷达配置区域（精简版）
+        radar_frame = ttk.LabelFrame(self.main_page_frame, text="📡 雷达监测配置", padding="5")
+        radar_frame.grid(row=2, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 5))
+        
+        # 雷达启用和串口（一行显示）
+        self.radar_enabled_var = tk.BooleanVar()
+        ttk.Checkbutton(radar_frame, text="启用雷达", variable=self.radar_enabled_var).grid(row=0, column=0, sticky=tk.W, padx=(0, 10))
+        
+        ttk.Label(radar_frame, text="串口:").grid(row=0, column=1, sticky=tk.W, padx=(0, 5))
+        self.radar_port_var = tk.StringVar()
+        ttk.Entry(radar_frame, textvariable=self.radar_port_var, width=15).grid(row=0, column=2, sticky=tk.W, padx=(0, 5))
+        
+        # 速度阈值
+        ttk.Label(radar_frame, text="速度阈值(m/s):").grid(row=0, column=3, sticky=tk.W, padx=(10, 5))
+        self.speed_threshold_var = tk.DoubleVar()
+        speed_frame = ttk.Frame(radar_frame)
+        speed_frame.grid(row=0, column=4, sticky=tk.W, padx=(0, 5))
+        ttk.Scale(speed_frame, from_=1.0, to=10.0, variable=self.speed_threshold_var, orient=tk.HORIZONTAL, length=100).pack(side=tk.LEFT)
+        self.speed_threshold_label = ttk.Label(speed_frame, text="3.0")
+        self.speed_threshold_label.pack(side=tk.LEFT, padx=(5, 0))
+        self.speed_threshold_var.trace('w', self.update_speed_threshold_label)
+        
+        # 雷达状态
+        ttk.Label(radar_frame, text="雷达状态:").grid(row=1, column=0, sticky=tk.W, padx=(0, 5))
+        self.radar_status_var = tk.StringVar()
+        self.radar_status_var.set("未连接")
+        self.radar_status_label = ttk.Label(radar_frame, textvariable=self.radar_status_var, foreground="red")
+        self.radar_status_label.grid(row=1, column=1, sticky=tk.W, padx=(0, 5))
+        
+        radar_frame.columnconfigure(2, weight=1)
+        radar_frame.columnconfigure(4, weight=1)
+        
+        # 4. 控制面板（移到主页面内，避免被视频流挡住）
+        control_frame = ttk.LabelFrame(self.main_page_frame, text="🎮 控制面板", padding="5")
+        control_frame.grid(row=3, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 5))
+        
+        # 主要控制按钮
+        main_controls = ttk.Frame(control_frame)
+        main_controls.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        
+        self.start_button = ttk.Button(main_controls, text="▶️ 开始检测", command=self.start_detection,
+                                      style="Accent.TButton")  # 使用强调样式
+        self.start_button.pack(side=tk.LEFT, padx=(0, 10))
+        
+        self.stop_button = ttk.Button(main_controls, text="⏹️ 停止检测", command=self.stop_detection, state=tk.DISABLED)
+        self.stop_button.pack(side=tk.LEFT, padx=(0, 10))
+        
+        self.save_button = ttk.Button(main_controls, text="📷 保存截图", command=self.save_screenshot, state=tk.DISABLED)
+        self.save_button.pack(side=tk.LEFT, padx=(0, 10))
+        
+        # 辅助控制按钮
+        aux_controls = ttk.Frame(control_frame)
+        aux_controls.pack(side=tk.RIGHT)
+        
+        self.camera_ai_button = ttk.Button(aux_controls, text="🤖 关闭摄像头AI", command=self.toggle_camera_ai)
+        self.camera_ai_button.pack(side=tk.LEFT, padx=(0, 10))
+        
+        self.reconnect_button = ttk.Button(aux_controls, text="🔄 重连RTSP", command=self.reconnect_rtsp, state=tk.DISABLED)
+        self.reconnect_button.pack(side=tk.LEFT)
+        
+        self.main_page_frame.columnconfigure(0, weight=1)
+    
+    def create_test_page(self):
+        """创建测试页面内容 - 所有测试功能"""
+        self.test_page_frame = ttk.Frame(self.config_container)
+        
+        # 创建滚动框架以容纳更多内容
+        canvas = tk.Canvas(self.test_page_frame, height=320)  # 调整高度适应较小窗口
+        scrollbar = ttk.Scrollbar(self.test_page_frame, orient="vertical", command=canvas.yview)
+        scrollable_frame = ttk.Frame(canvas)
+        
+        scrollable_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        
+        # 1. RTSP流详细配置
+        rtsp_test_frame = ttk.LabelFrame(scrollable_frame, text="🎥 RTSP流测试配置", padding="5")
+        rtsp_test_frame.grid(row=0, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 5), padx=(0, 10))
+        
+        # RGB源和IR源
+        ttk.Label(rtsp_test_frame, text="RGB源:").grid(row=0, column=0, sticky=tk.W, padx=(0, 5))
+        self.rgb_source_var = tk.StringVar()
+        self.rgb_entry = ttk.Entry(rtsp_test_frame, textvariable=self.rgb_source_var, width=32)  # 调整宽度
+        self.rgb_entry.grid(row=0, column=1, sticky=(tk.W, tk.E), padx=(0, 5))
+        ttk.Button(rtsp_test_frame, text="测试RGB", command=lambda: self.test_rtsp_stream("RGB")).grid(row=0, column=2)
+        
+        ttk.Label(rtsp_test_frame, text="IR源:").grid(row=1, column=0, sticky=tk.W, padx=(0, 5))
+        self.ir_source_var = tk.StringVar()
+        self.ir_entry = ttk.Entry(rtsp_test_frame, textvariable=self.ir_source_var, width=32)  # 调整宽度
+        self.ir_entry.grid(row=1, column=1, sticky=(tk.W, tk.E), padx=(0, 5))
+        ttk.Button(rtsp_test_frame, text="测试IR", command=lambda: self.test_rtsp_stream("IR")).grid(row=1, column=2)
+        
+        # RTSP传输协议
+        ttk.Label(rtsp_test_frame, text="传输协议:").grid(row=2, column=0, sticky=tk.W, padx=(0, 5))
+        self.rtsp_transport_var = tk.StringVar()
+        transport_combo = ttk.Combobox(rtsp_test_frame, textvariable=self.rtsp_transport_var, 
+                                     values=["TCP (推荐)", "UDP", "自动"], 
+                                     state="readonly", width=20)
+        transport_combo.grid(row=2, column=1, sticky=tk.W, padx=(0, 5))
+        
+        # 网络缓冲调整
+        ttk.Label(rtsp_test_frame, text="网络缓冲(ms):").grid(row=3, column=0, sticky=tk.W, padx=(0, 5))
+        self.buffer_time_var = tk.IntVar()
+        buffer_frame = ttk.Frame(rtsp_test_frame)
+        buffer_frame.grid(row=3, column=1, sticky=(tk.W, tk.E))
+        ttk.Scale(buffer_frame, from_=10, to=500, variable=self.buffer_time_var, orient=tk.HORIZONTAL, length=200).pack(side=tk.LEFT)
+        self.buffer_time_label = ttk.Label(buffer_frame, text="100 ms")
+        self.buffer_time_label.pack(side=tk.LEFT, padx=(5,0))
+        self.buffer_time_var.trace('w', self.update_buffer_label)
+        
+        rtsp_test_frame.columnconfigure(1, weight=1)
+        
+        # 2. 设备和系统测试
+        device_test_frame = ttk.LabelFrame(scrollable_frame, text="💻 设备和系统测试", padding="5")
+        device_test_frame.grid(row=1, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 5), padx=(0, 10))
+        
+        # 设备状态
+        ttk.Label(device_test_frame, text="计算设备:").grid(row=0, column=0, sticky=tk.W, padx=(0, 5))
+        self.device_status_var = tk.StringVar()
+        self.device_status_var.set("未检测")
+        self.device_status_label = ttk.Label(device_test_frame, textvariable=self.device_status_var, foreground="gray")
+        self.device_status_label.grid(row=0, column=1, sticky=tk.W, padx=(0, 5))
+        ttk.Button(device_test_frame, text="检测设备", command=self.test_device).grid(row=0, column=2)
+        
+        # 处理模式
+        ttk.Label(device_test_frame, text="处理模式:").grid(row=1, column=0, sticky=tk.W, padx=(0, 5))
+        self.alignment_status_var = tk.StringVar()
+        self.alignment_status_var.set("独立处理模式")
+        self.alignment_status_label = ttk.Label(device_test_frame, textvariable=self.alignment_status_var, foreground="gray")
+        self.alignment_status_label.grid(row=1, column=1, sticky=tk.W, padx=(0, 5))
+        
+        # 视频解码
+        ttk.Label(device_test_frame, text="视频解码:").grid(row=2, column=0, sticky=tk.W, padx=(0, 5))
+        self.decode_status_var = tk.StringVar()
+        self.decode_status_var.set("GPU硬件加速")
+        self.decode_status_label = ttk.Label(device_test_frame, textvariable=self.decode_status_var, foreground="green")
+        self.decode_status_label.grid(row=2, column=1, sticky=tk.W, padx=(0, 5))
+        
+        device_test_frame.columnconfigure(1, weight=1)
+        
+        # 3. 摄像头AI控制测试
+        camera_ai_frame = ttk.LabelFrame(scrollable_frame, text="📷 摄像头AI控制测试", padding="5")
+        camera_ai_frame.grid(row=2, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 5), padx=(0, 10))
+        
+        # 摄像头AI启用
+        ttk.Label(camera_ai_frame, text="摄像头AI:").grid(row=0, column=0, sticky=tk.W, padx=(0, 5))
+        self.camera_ai_enabled_var = tk.BooleanVar()
+        ai_frame = ttk.Frame(camera_ai_frame)
+        ai_frame.grid(row=0, column=1, sticky=tk.W, padx=(0, 5))
+        ttk.Checkbutton(ai_frame, text="启用AI", variable=self.camera_ai_enabled_var).pack(side=tk.LEFT)
+        ttk.Button(ai_frame, text="应用设置", command=self.apply_camera_ai_setting).pack(side=tk.LEFT, padx=(5, 0))
+        
+        # AI状态
+        self.camera_ai_status_var = tk.StringVar()
+        self.camera_ai_status_var.set("未设置")
+        self.camera_ai_status_label = ttk.Label(camera_ai_frame, textvariable=self.camera_ai_status_var, foreground="gray")
+        self.camera_ai_status_label.grid(row=0, column=2, sticky=tk.W, padx=(5, 0))
+        
+        # 摄像头工作模式
+        ttk.Label(camera_ai_frame, text="工作模式:").grid(row=1, column=0, sticky=tk.W, padx=(0, 5))
+        self.camera_mode_var = tk.StringVar()
+        camera_mode_combo = ttk.Combobox(camera_ai_frame, textvariable=self.camera_mode_var, 
+                                        values=["自动切换", "双路输出", "融合模式"], 
+                                        state="readonly", width=20)
+        camera_mode_combo.grid(row=1, column=1, sticky=tk.W, padx=(0, 5))
+        camera_mode_combo.set("双路输出")
+        ttk.Button(camera_ai_frame, text="设置模式", command=self.apply_camera_mode).grid(row=1, column=2, padx=(5, 0))
+        
+        # 网络诊断
+        ttk.Label(camera_ai_frame, text="网络诊断:").grid(row=2, column=0, sticky=tk.W, padx=(0, 5))
+        network_frame = ttk.Frame(camera_ai_frame)
+        network_frame.grid(row=2, column=1, sticky=tk.W, padx=(0, 5))
+        ttk.Button(network_frame, text="Ping测试", command=self.test_camera_ping).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(network_frame, text="端口测试", command=self.test_camera_port).pack(side=tk.LEFT)
+        
+        camera_ai_frame.columnconfigure(1, weight=1)
+        
+        # 4. 雷达测试
+        radar_test_frame = ttk.LabelFrame(scrollable_frame, text="📡 雷达测试", padding="5")
+        radar_test_frame.grid(row=3, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 5), padx=(0, 10))
+        
+        ttk.Button(radar_test_frame, text="测试雷达连接", command=self.test_radar).grid(row=0, column=0, padx=(0, 5))
+        ttk.Button(radar_test_frame, text="测试Kafka连接", command=self.test_kafka).grid(row=0, column=1, padx=(5, 0))
+        
+        # 5. 模拟测试区域
+        simulation_frame = ttk.LabelFrame(scrollable_frame, text="🧪 模拟测试配置", padding="5")
+        simulation_frame.grid(row=4, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 5), padx=(0, 10))
+        
+        # 图片路径选择
+        ttk.Label(simulation_frame, text="测试图片:").grid(row=0, column=0, sticky=tk.W, padx=(0, 5))
+        self.test_image_path_var = tk.StringVar()
+        ttk.Entry(simulation_frame, textvariable=self.test_image_path_var, width=24).grid(row=0, column=1, sticky=(tk.W, tk.E), padx=(0, 5))  # 调整宽度
+        ttk.Button(simulation_frame, text="浏览", command=self.browse_test_image).grid(row=0, column=2, padx=(5, 0))
+        
+        # 异常类型和置信度
+        ttk.Label(simulation_frame, text="异常类型:").grid(row=1, column=0, sticky=tk.W, padx=(0, 5))
+        self.simulation_class_var = tk.StringVar()
+        simulation_combo = ttk.Combobox(simulation_frame, textvariable=self.simulation_class_var, 
+                                       values=["climb over", "tailgating", "carrybaby", "Abnormal reverse", "Reverse Tailgating", "crawl"], 
+                                       state="readonly", width=20)
+        simulation_combo.grid(row=1, column=1, sticky=tk.W, padx=(0, 5))
+        simulation_combo.set("climb over")
+        
+        ttk.Label(simulation_frame, text="置信度:").grid(row=1, column=2, sticky=tk.W, padx=(10, 5))
+        self.simulation_confidence_var = tk.DoubleVar()
+        self.simulation_confidence_var.set(0.85)
+        sim_conf_frame = ttk.Frame(simulation_frame)
+        sim_conf_frame.grid(row=1, column=3, sticky=tk.W, padx=(0, 5))
+        ttk.Scale(sim_conf_frame, from_=0.5, to=1.0, variable=self.simulation_confidence_var, orient=tk.HORIZONTAL, length=100).pack(side=tk.LEFT)
+        self.simulation_confidence_label = ttk.Label(sim_conf_frame, text="0.85")
+        self.simulation_confidence_label.pack(side=tk.LEFT, padx=(5, 0))
+        self.simulation_confidence_var.trace('w', self.update_simulation_confidence_label)
+        
+        # 模拟测试按钮
+        ttk.Label(simulation_frame, text="测试操作:").grid(row=2, column=0, sticky=tk.W, padx=(0, 5))
+        sim_button_frame = ttk.Frame(simulation_frame)
+        sim_button_frame.grid(row=2, column=1, columnspan=3, sticky=tk.W, padx=(0, 5))
+        
+        ttk.Button(sim_button_frame, text="预览图片", command=self.preview_test_image).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(sim_button_frame, text="发送单张", command=self.send_single_simulation).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(sim_button_frame, text="批量测试", command=self.send_batch_simulation).pack(side=tk.LEFT)
+        
+        # 测试状态
+        ttk.Label(simulation_frame, text="测试状态:").grid(row=3, column=0, sticky=tk.W, padx=(0, 5))
+        self.simulation_status_var = tk.StringVar()
+        self.simulation_status_var.set("就绪")
+        self.simulation_status_label = ttk.Label(simulation_frame, textvariable=self.simulation_status_var, foreground="gray")
+        self.simulation_status_label.grid(row=3, column=1, columnspan=3, sticky=tk.W, padx=(0, 5))
+        
+        simulation_frame.columnconfigure(1, weight=1)
+        simulation_frame.columnconfigure(3, weight=1)
+        
+        # 配置滚动区域
+        scrollable_frame.columnconfigure(0, weight=1)
+        
+        # 绑定鼠标滚轮事件
+        def _on_mousewheel(event):
+            canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+        canvas.bind_all("<MouseWheel>", _on_mousewheel)
+        
+        self.test_page_frame.columnconfigure(0, weight=1)
+    
+    def create_shared_areas(self, main_frame):
+        """创建共享区域 - 显示区域、信息区域"""
+        
+        # 显示区域（控制面板已移到主页面内）
+        display_frame = ttk.LabelFrame(main_frame, text="📺 双模态视频监控", padding="5")
+        display_frame.grid(row=2, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 10))
+        display_frame.columnconfigure(0, weight=1)
+        display_frame.columnconfigure(1, weight=1)
+        display_frame.rowconfigure(0, weight=1)
+        
+        # RGB视频显示
+        rgb_frame = ttk.LabelFrame(display_frame, text="🌈 RGB视频流")
+        rgb_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), padx=(0, 5))
+        
+        self.rgb_label = ttk.Label(rgb_frame, text="RGB视频将在这里显示\n请点击'开始检测'", 
+                                  font=("Arial", 11), foreground="gray")
+        self.rgb_label.pack(expand=True)
+        
+        # IR视频显示
+        ir_frame = ttk.LabelFrame(display_frame, text="🌡️ IR热成像视频流")
+        ir_frame.grid(row=0, column=1, sticky=(tk.W, tk.E, tk.N, tk.S), padx=(5, 0))
+        
+        self.ir_label = ttk.Label(ir_frame, text="IR视频将在这里显示\n请点击'开始检测'", 
+                                 font=("Arial", 11), foreground="gray")
+        self.ir_label.pack(expand=True)
+        
+        # 信息区域
+        info_frame = ttk.LabelFrame(main_frame, text="📊 系统信息监控", padding="5")
+        info_frame.grid(row=3, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
+        info_frame.columnconfigure(0, weight=1)
+        info_frame.columnconfigure(1, weight=1)
+        info_frame.columnconfigure(2, weight=1)
+        info_frame.columnconfigure(3, weight=1)
+        
+        # 统计信息
+        stats_frame = ttk.LabelFrame(info_frame, text="📈 统计信息")
+        stats_frame.grid(row=0, column=0, sticky=(tk.W, tk.E), padx=(0, 2))
+        
+        self.stats_text = tk.Text(stats_frame, height=4, width=20, font=("Consolas", 8))  # 调整高度和宽度
+        self.stats_text.pack(fill=tk.BOTH, expand=True)
+        
+        # 检测结果
+        results_frame = ttk.LabelFrame(info_frame, text="🎯 检测结果")
+        results_frame.grid(row=0, column=1, sticky=(tk.W, tk.E), padx=2)
+        
+        self.results_text = tk.Text(results_frame, height=4, width=20, font=("Consolas", 8))  # 调整高度和宽度
+        self.results_text.pack(fill=tk.BOTH, expand=True)
+        
+        # 雷达信息
+        radar_info_frame = ttk.LabelFrame(info_frame, text="📡 雷达数据")
+        radar_info_frame.grid(row=0, column=2, sticky=(tk.W, tk.E), padx=2)
+        
+        self.radar_text = tk.Text(radar_info_frame, height=4, width=18, font=("Consolas", 8))  # 调整高度和宽度
+        self.radar_text.pack(fill=tk.BOTH, expand=True)
+        
+        # Kafka日志
+        kafka_log_frame = ttk.LabelFrame(info_frame, text="📡 Kafka日志")
+        kafka_log_frame.grid(row=0, column=3, sticky=(tk.W, tk.E), padx=(2, 0))
+        
+        self.kafka_log_text = tk.Text(kafka_log_frame, height=4, width=18, font=("Consolas", 8))  # 调整高度和宽度
+        self.kafka_log_text.pack(fill=tk.BOTH, expand=True)
+        
+        # 状态栏
+        self.status_var = tk.StringVar()
+        self.status_var.set("就绪 - 请配置检测参数并点击开始检测")
+        status_bar = ttk.Label(main_frame, textvariable=self.status_var, relief=tk.SUNKEN, 
+                              font=("Arial", 9), padding="5")
+        status_bar.grid(row=4, column=0, sticky=(tk.W, tk.E), pady=(10, 0))
+    
+    def switch_page(self, page_name):
+        """切换页面"""
+        # 隐藏所有页面
+        self.main_page_frame.grid_remove()
+        self.test_page_frame.grid_remove()
+        
+        # 显示选中的页面
+        if page_name == "main":
+            self.main_page_frame.grid(row=0, column=0, sticky=(tk.W, tk.E))
+            self.page_indicator.config(text="当前：主页面", foreground="blue")
+            self.main_page_btn.state(['pressed'])
+            self.test_page_btn.state(['!pressed'])
+            self.quick_status_var.set("主检测页面")
+        elif page_name == "test":
+            self.test_page_frame.grid(row=0, column=0, sticky=(tk.W, tk.E))
+            self.page_indicator.config(text="当前：测试页面", foreground="orange")
+            self.test_page_btn.state(['pressed'])
+            self.main_page_btn.state(['!pressed'])
+            self.quick_status_var.set("测试功能页面")
+        
+        self.page_var.set(page_name)
+        
+        # 更新状态栏
+        if page_name == "main":
+            self.status_var.set("主页面 - 配置检测参数并开始检测")
+        else:
+            self.status_var.set("测试页面 - 进行各种功能测试和调试")
+    
+    def update_confidence_label(self, *args):
+        """更新置信度标签"""
+        self.confidence_label.config(text=f"{self.confidence_var.get():.2f}")
+    
+    def update_buffer_label(self, *args):
+        """更新网络缓冲标签"""
+        self.buffer_time_label.config(text=f"{self.buffer_time_var.get()} ms")
+    
+    def update_speed_threshold_label(self, *args):
+        """更新速度阈值标签"""
+        global SPEED_THRESHOLD
+        SPEED_THRESHOLD = self.speed_threshold_var.get()
+        self.speed_threshold_label.config(text=f"{SPEED_THRESHOLD:.1f}")
+    
+    def update_simulation_confidence_label(self, *args):
+        """更新模拟置信度标签"""
+        self.simulation_confidence_label.config(text=f"{self.simulation_confidence_var.get():.2f}")
+    
+    def browse_test_image(self):
+        """浏览测试图片文件"""
+        filename = filedialog.askopenfilename(
+            title="选择测试图片",
+            filetypes=[
+                ("图片文件", "*.jpg *.jpeg *.png *.bmp *.tiff *.tif"),
+                ("JPEG文件", "*.jpg *.jpeg"),
+                ("PNG文件", "*.png"),
+                ("所有文件", "*.*")
+            ]
+        )
+        if filename:
+            self.test_image_path_var.set(filename)
+            self.simulation_status_var.set("图片已选择")
+            self.simulation_status_label.configure(foreground="blue")
+    
+    def preview_test_image(self):
+        """预览测试图片"""
+        image_path = self.test_image_path_var.get()
+        if not image_path:
+            messagebox.showerror("错误", "请先选择测试图片！")
+            return
+        
+        if not os.path.exists(image_path):
+            messagebox.showerror("错误", "图片文件不存在！")
+            return
+        
+        try:
+            # 使用OpenCV读取图片
+            image = cv2.imread(image_path)
+            if image is None:
+                messagebox.showerror("错误", "无法读取图片文件！请确认是有效的图片格式。")
+                return
+            
+            # 转换颜色格式
+            image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            
+            # 调整显示尺寸
+            h, w = image_rgb.shape[:2]
+            max_size = 400
+            if w > max_size or h > max_size:
+                scale = min(max_size/w, max_size/h)
+                new_w, new_h = int(w*scale), int(h*scale)
+                image_rgb = cv2.resize(image_rgb, (new_w, new_h))
+            
+            # 创建新窗口显示图片
+            preview_window = tk.Toplevel(self.root)
+            preview_window.title(f"图片预览 - {os.path.basename(image_path)}")
+            preview_window.geometry("500x500")
+            
+            # 显示图片信息
+            info_label = ttk.Label(preview_window, text=f"文件: {os.path.basename(image_path)}\n原始尺寸: {w}x{h}\n模拟异常: {self.simulation_class_var.get()}")
+            info_label.pack(pady=10)
+            
+            # 显示图片
+            image_pil = Image.fromarray(image_rgb)
+            photo = ImageTk.PhotoImage(image_pil)
+            
+            image_label = ttk.Label(preview_window, image=photo)
+            image_label.image = photo  # 保持引用
+            image_label.pack(expand=True)
+            
+            # 关闭按钮
+            ttk.Button(preview_window, text="关闭", command=preview_window.destroy).pack(pady=10)
+            
+        except Exception as e:
+            messagebox.showerror("错误", f"预览图片失败: {e}")
+    
+    def send_single_simulation(self):
+        """发送单张图片的模拟消息"""
+        image_path = self.test_image_path_var.get()
+        if not image_path:
+            messagebox.showerror("错误", "请先选择测试图片！")
+            return
+        
+        if not os.path.exists(image_path):
+            messagebox.showerror("错误", "图片文件不存在！")
+            return
+        
+        # 检查Kafka连接
+        if not self.kafka_producer or not self.kafka_producer.is_connected:
+            messagebox.showerror("错误", "Kafka未连接！请先测试Kafka连接。")
+            return
+        
+        def send_simulation():
+            try:
+                self.simulation_status_var.set("正在发送模拟消息...")
+                self.simulation_status_label.configure(foreground="blue")
+                self.root.update()
+                
+                # 读取图片
+                image = cv2.imread(image_path)
+                if image is None:
+                    raise Exception("无法读取图片文件")
+                
+                # 模拟检测结果
+                class_name = self.simulation_class_var.get()
+                confidence = self.simulation_confidence_var.get()
+                
+                # 生成模拟的边界框（图片中心区域）
+                h, w = image.shape[:2]
+                margin = 0.2  # 20%边距
+                x1 = int(w * margin)
+                y1 = int(h * margin)
+                x2 = int(w * (1 - margin))
+                y2 = int(h * (1 - margin))
+                bbox = [x1, y1, x2, y2]
+                
+                # 创建模拟检测对象
+                detection = {
+                    'class_name': class_name,
+                    'confidence': confidence,
+                    'bbox': bbox
+                }
+                
+                # 创建图片快照
+                detection_snapshot = self._create_simulation_detection_snapshot(image, bbox, class_name)
+                
+                # 使用标准化方法创建检测对象
+                standard_detection = self.create_standard_detection_object(
+                    class_name=class_name,
+                    confidence=confidence,
+                    bbox=bbox,
+                    additional_data={
+                        'detection_snapshot': detection_snapshot,
+                        'simulation_source': os.path.basename(image_path),
+                        'timestamp': time.time()
+                    }
+                )
+                
+                # 创建完整场景快照
+                scene_snapshot = self._create_simulation_scene_snapshot(image, [detection])
+                
+                # 使用标准化方法创建预警消息
+                alert_message = self.create_standard_alert_message(
+                    camera_id=self.camera_id_var.get(),
+                    detections=[standard_detection],
+                    camera_location=self.camera_location_var.get(),
+                    additional_data={
+                        'snapshot': scene_snapshot,
+                        'confidence_threshold': self.confidence_var.get(),
+                        'simulation_mode': True,
+                        'simulation_source': image_path,
+                        'message_type': 'simulation_test'
+                    }
+                )
+                
+                # 发送到Kafka
+                success = self.kafka_producer.send_alert(alert_message)
+                
+                if success:
+                    self.simulation_status_var.set("模拟消息发送成功")
+                    self.simulation_status_label.configure(foreground="green")
+                    self.log_kafka_message(f"✅ 模拟消息已发送: {class_name} (置信度: {confidence:.2f})")
+                    self.log_kafka_message(f"📷 图片来源: {os.path.basename(image_path)}")
+                    messagebox.showinfo("成功", f"模拟消息已发送到Kafka！\n\n异常类型: {class_name}\n置信度: {confidence:.2f}\n图片: {os.path.basename(image_path)}")
+                else:
+                    self.simulation_status_var.set("发送失败")
+                    self.simulation_status_label.configure(foreground="red")
+                    self.log_kafka_message(f"❌ 模拟消息发送失败")
+                    messagebox.showerror("错误", "模拟消息发送失败！")
+                
+            except Exception as e:
+                self.simulation_status_var.set("发送异常")
+                self.simulation_status_label.configure(foreground="red")
+                self.log_kafka_message(f"❌ 模拟消息异常: {e}")
+                messagebox.showerror("错误", f"发送模拟消息失败: {e}")
+        
+        # 在新线程中执行，避免阻塞GUI
+        threading.Thread(target=send_simulation, daemon=True).start()
+    
+    def send_batch_simulation(self):
+        """批量发送目录下所有图片的模拟消息"""
+        image_path = self.test_image_path_var.get()
+        
+        # 如果输入的是文件，则使用其目录
+        if os.path.isfile(image_path):
+            directory = os.path.dirname(image_path)
+        elif os.path.isdir(image_path):
+            directory = image_path
+        else:
+            # 让用户选择目录
+            directory = filedialog.askdirectory(title="选择包含测试图片的目录")
+            if not directory:
+                return
+        
+        # 检查Kafka连接
+        if not self.kafka_producer or not self.kafka_producer.is_connected:
+            messagebox.showerror("错误", "Kafka未连接！请先测试Kafka连接。")
+            return
+        
+        def send_batch():
+            try:
+                self.simulation_status_var.set("正在扫描图片...")
+                self.simulation_status_label.configure(foreground="blue")
+                self.root.update()
+                
+                # 查找所有图片文件
+                image_extensions = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.tif'}
+                image_files = []
+                
+                for file in os.listdir(directory):
+                    if os.path.splitext(file.lower())[1] in image_extensions:
+                        image_files.append(os.path.join(directory, file))
+                
+                if not image_files:
+                    messagebox.showwarning("警告", f"目录中未找到图片文件！\n目录: {directory}")
+                    return
+                
+                # 确认批量发送
+                if not messagebox.askyesno("确认批量发送", 
+                                         f"找到 {len(image_files)} 个图片文件。\n"
+                                         f"将使用异常类型: {self.simulation_class_var.get()}\n"
+                                         f"置信度: {self.simulation_confidence_var.get():.2f}\n\n"
+                                         f"确定要发送所有模拟消息吗？"):
+                    self.simulation_status_var.set("批量发送已取消")
+                    self.simulation_status_label.configure(foreground="gray")
+                    return
+                
+                # 批量发送
+                success_count = 0
+                failed_count = 0
+                class_name = self.simulation_class_var.get()
+                confidence = self.simulation_confidence_var.get()
+                
+                for i, image_path in enumerate(image_files, 1):
+                    try:
+                        self.simulation_status_var.set(f"发送中 {i}/{len(image_files)}: {os.path.basename(image_path)}")
+                        self.root.update()
+                        
+                        # 读取图片
+                        image = cv2.imread(image_path)
+                        if image is None:
+                            failed_count += 1
+                            self.log_kafka_message(f"❌ 无法读取图片: {os.path.basename(image_path)}")
+                            continue
+                        
+                        # 生成模拟的边界框
+                        h, w = image.shape[:2]
+                        margin = 0.2
+                        x1 = int(w * margin)
+                        y1 = int(h * margin)
+                        x2 = int(w * (1 - margin))
+                        y2 = int(h * (1 - margin))
+                        bbox = [x1, y1, x2, y2]
+                        
+                        # 创建图片快照
+                        detection_snapshot = self._create_simulation_detection_snapshot(image, bbox, class_name)
+                        
+                        # 创建标准检测对象
+                        standard_detection = self.create_standard_detection_object(
+                            class_name=class_name,
+                            confidence=confidence,
+                            bbox=bbox,
+                            additional_data={
+                                'detection_snapshot': detection_snapshot,
+                                'simulation_source': os.path.basename(image_path),
+                                'timestamp': time.time(),
+                                'batch_index': i,
+                                'batch_total': len(image_files)
+                            }
+                        )
+                        
+                        # 创建完整场景快照
+                        scene_snapshot = self._create_simulation_scene_snapshot(image, [{'class_name': class_name, 'confidence': confidence, 'bbox': bbox}])
+                        
+                        # 创建预警消息
+                        alert_message = self.create_standard_alert_message(
+                            camera_id=self.camera_id_var.get(),
+                            detections=[standard_detection],
+                            camera_location=self.camera_location_var.get(),
+                            additional_data={
+                                'snapshot': scene_snapshot,
+                                'confidence_threshold': self.confidence_var.get(),
+                                'simulation_mode': True,
+                                'simulation_source': image_path,
+                                'message_type': 'simulation_batch_test',
+                                'batch_info': {
+                                    'index': i,
+                                    'total': len(image_files),
+                                    'directory': directory
+                                }
+                            }
+                        )
+                        
+                        # 发送到Kafka
+                        success = self.kafka_producer.send_alert(alert_message)
+                        
+                        if success:
+                            success_count += 1
+                            self.log_kafka_message(f"✅ 批量 {i}/{len(image_files)}: {os.path.basename(image_path)}")
+                        else:
+                            failed_count += 1
+                            self.log_kafka_message(f"❌ 批量发送失败: {os.path.basename(image_path)}")
+                        
+                        # 控制发送频率，避免过快
+                        time.sleep(0.1)
+                        
+                    except Exception as e:
+                        failed_count += 1
+                        self.log_kafka_message(f"❌ 处理失败 {os.path.basename(image_path)}: {e}")
+                
+                # 显示批量发送结果
+                self.simulation_status_var.set(f"批量发送完成: {success_count}成功, {failed_count}失败")
+                if failed_count == 0:
+                    self.simulation_status_label.configure(foreground="green")
+                else:
+                    self.simulation_status_label.configure(foreground="orange")
+                
+                messagebox.showinfo("批量发送完成", 
+                                  f"批量模拟消息发送完成！\n\n"
+                                  f"总图片数: {len(image_files)}\n"
+                                  f"发送成功: {success_count}\n"
+                                  f"发送失败: {failed_count}\n"
+                                  f"异常类型: {class_name}\n"
+                                  f"置信度: {confidence:.2f}")
+                
+            except Exception as e:
+                self.simulation_status_var.set("批量发送异常")
+                self.simulation_status_label.configure(foreground="red")
+                self.log_kafka_message(f"❌ 批量发送异常: {e}")
+                messagebox.showerror("错误", f"批量发送失败: {e}")
+        
+        # 在新线程中执行
+        threading.Thread(target=send_batch, daemon=True).start()
+    
+    def _create_simulation_detection_snapshot(self, image, bbox, class_name):
+        """为模拟测试创建检测结果的裁剪图片快照"""
+        try:
+            x1, y1, x2, y2 = map(int, bbox)
+            
+            # 确保坐标在图像范围内
+            h, w = image.shape[:2]
+            x1, x2 = max(0, x1), min(w, x2)
+            y1, y2 = max(0, y1), min(h, y2)
+            
+            # 裁剪图片
+            crop = image[y1:y2, x1:x2]
+            
+            # 编码为Base64
+            crop_base64, crop_size = self._encode_image_to_base64(crop, 85, (400, 300))
+            
+            return {
+                "rgb_crop_base64": crop_base64,
+                "ir_crop_base64": crop_base64,  # 模拟测试中RGB和IR使用相同图片
+                "crop_size": [crop_size[0], crop_size[1]],
+                "image_format": "jpeg",
+                "image_quality": 85,
+                "crop_region": [float(x1), float(y1), float(x2), float(y2)],
+                "simulation_note": "模拟测试图片，RGB和IR相同"
+            }
+        except Exception as e:
+            print(f"创建模拟检测快照失败: {e}")
+            return None
+    
+    def _create_simulation_scene_snapshot(self, image, detections):
+        """为模拟测试创建完整场景图片快照"""
+        try:
+            # 创建带有检测框的标注图片
+            annotated_image = image.copy()
+            
+            for detection in detections:
+                bbox = detection['bbox']
+                class_name = detection['class_name']
+                confidence = detection['confidence']
+                
+                x1, y1, x2, y2 = map(int, bbox)
+                color = (0, 0, 255)  # 红色框表示异常
+                
+                # 绘制检测框
+                cv2.rectangle(annotated_image, (x1, y1), (x2, y2), color, 3)
+                
+                # 绘制标签
+                label = f"{class_name}: {confidence:.2f}"
+                label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
+                cv2.rectangle(annotated_image, (x1, y1-label_size[1]-10), 
+                            (x1+label_size[0], y1), color, -1)
+                cv2.putText(annotated_image, label, (x1, y1-5), 
+                          cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            
+            # 编码为Base64
+            image_base64, image_size = self._encode_image_to_base64(annotated_image, 75, (640, 480))
+            
+            return {
+                "rgb_image_base64": image_base64,
+                "ir_image_base64": image_base64,  # 模拟测试中RGB和IR使用相同图片
+                "image_format": "jpeg",
+                "image_size": [image_size[0], image_size[1]],
+                "image_quality": 75,
+                "has_annotations": True,
+                "description": "模拟测试完整场景图片，包含检测框",
+                "simulation_note": "模拟测试图片，RGB和IR相同"
+            }
+        except Exception as e:
+            print(f"创建模拟场景快照失败: {e}")
+            return None
+    
+    def _encode_image_to_base64(self, image, quality=85, resize_to=None):
+        """将OpenCV图片编码为Base64字符串"""
+        try:
+            # 调整图片尺寸
+            if resize_to:
+                h, w = image.shape[:2]
+                target_w, target_h = resize_to
+                
+                # 保持长宽比
+                scale = min(target_w/w, target_h/h)
+                new_w, new_h = int(w*scale), int(h*scale)
+                
+                if new_w != w or new_h != h:
+                    image = cv2.resize(image, (new_w, new_h))
+                
+                resize_to = (new_w, new_h)
+            
+            # 编码为JPEG
+            encode_params = [cv2.IMWRITE_JPEG_QUALITY, quality]
+            success, encoded_image = cv2.imencode('.jpg', image, encode_params)
+            
+            if not success:
+                raise Exception("图片编码失败")
+            
+            # 转换为Base64
+            import base64
+            image_base64 = base64.b64encode(encoded_image.tobytes()).decode('utf-8')
+            image_base64_with_prefix = f"data:image/jpeg;base64,{image_base64}"
+            
+            final_size = resize_to if resize_to else (image.shape[1], image.shape[0])
+            
+            return image_base64_with_prefix, final_size
+            
+        except Exception as e:
+            print(f"图片编码失败: {e}")
+            return None, None
+    
+    def apply_camera_ai_setting(self):
+        """应用摄像头AI设置"""
+        if not self.camera_ai_controller:
+            # 从RTSP基础IP提取摄像头IP
+            base_ip = self.rtsp_base_ip_var.get()
+            if base_ip:
+                self.camera_ai_controller = CameraAIController(camera_ip=base_ip)
+            else:
+                messagebox.showerror("错误", "请先设置RTSP基础IP地址！")
+                return
+        
+        enable_ai = self.camera_ai_enabled_var.get()
+        
+        def apply_setting():
+            try:
+                self.status_var.set("正在设置摄像头AI...")
+                self.root.update()
+                
+                if enable_ai:
+                    success, response, error = self.camera_ai_controller.enable_ai()
+                    if success:
+                        self.camera_ai_status_var.set("AI启用命令已发送")
+                        self.camera_ai_status_label.configure(foreground="blue")
+                        
+                        # 验证AI状态
+                        verification_success = self.camera_ai_controller.verify_ai_status_after_set(expected_disabled=False)
+                        if verification_success:
+                            self.camera_ai_status_var.set("AI已启用")
+                            self.camera_ai_status_label.configure(foreground="blue")
+                            messagebox.showinfo("成功", "摄像头AI功能已启用")
+                        else:
+                            self.camera_ai_status_var.set("AI状态未确认")
+                            self.camera_ai_status_label.configure(foreground="orange")
+                            messagebox.showwarning("警告", "AI启用命令已发送，但状态验证失败")
+                    else:
+                        self.camera_ai_status_var.set("设置失败")
+                        self.camera_ai_status_label.configure(foreground="red")
+                        messagebox.showerror("错误", f"启用摄像头AI失败: {error}")
+                else:
+                    success, response, error = self.camera_ai_controller.disable_ai()
+                    if success:
+                        self.camera_ai_status_var.set("AI关闭命令已发送")
+                        self.camera_ai_status_label.configure(foreground="blue")
+                        
+                        # 验证AI状态
+                        verification_success = self.camera_ai_controller.verify_ai_status_after_set(expected_disabled=True)
+                        if verification_success:
+                            self.camera_ai_status_var.set("AI已关闭")
+                            self.camera_ai_status_label.configure(foreground="green")
+                            messagebox.showinfo("成功", "摄像头AI功能已关闭")
+                            self.camera_ai_disabled = True
+                        else:
+                            self.camera_ai_status_var.set("AI状态未确认")
+                            self.camera_ai_status_label.configure(foreground="orange")
+                            messagebox.showwarning("警告", "AI关闭命令已发送，但状态验证失败")
+                            self.camera_ai_disabled = True  # 假设成功
+                    else:
+                        self.camera_ai_status_var.set("设置失败")
+                        self.camera_ai_status_label.configure(foreground="red")
+                        messagebox.showerror("错误", f"关闭摄像头AI失败: {error}")
+                        
+            except Exception as e:
+                self.camera_ai_status_var.set("设置异常")
+                self.camera_ai_status_label.configure(foreground="red")
+                messagebox.showerror("错误", f"摄像头AI设置异常: {e}")
+            
+            self.status_var.set("就绪")
+        
+        # 在新线程中执行，避免阻塞GUI
+        threading.Thread(target=apply_setting, daemon=True).start()
+    
+    def auto_disable_camera_ai(self):
+        """自动关闭摄像头AI功能（在连接RTSP流时调用），仅发送指令，不等待响应或验证。"""
+        if self.camera_ai_disabled:
+            print("📷 摄像头AI已标记为关闭，跳过自动设置")
+            return True
+
+        try:
+            base_ip = self.rtsp_base_ip_var.get()
+            if not base_ip:
+                print("⚠️ 未设置RTSP基础IP，跳过摄像头AI自动关闭")
+                return False
+
+            print("🤖 正在发送关闭摄像头AI指令...")
+
+            if not self.camera_ai_controller:
+                self.camera_ai_controller = CameraAIController(camera_ip=base_ip)
+
+            # 只发送一次关闭指令，不等待响应或验证结果
+            success, _, error = self.camera_ai_controller.disable_ai()
+
+            # 无论成功与否，都标记为已处理，避免重复发送
+            self.camera_ai_disabled = True
+
+            if success:
+                print("✅ 摄像头AI关闭指令已发送 (不等待响应)。")
+                self.root.after(0, lambda: self.camera_ai_status_var.set("AI关闭指令已发送"))
+                self.root.after(0, lambda: self.camera_ai_status_label.configure(foreground="blue"))
+                self.root.after(0, lambda: self.camera_ai_enabled_var.set(False))
+                return True
+            else:
+                print(f"⚠️ 发送关闭摄像头AI指令失败: {error}")
+                self.root.after(0, lambda: self.camera_ai_status_var.set("关闭指令发送失败"))
+                self.root.after(0, lambda: self.camera_ai_status_label.configure(foreground="orange"))
+                # 即使失败也继续执行，因为用户不希望被阻塞
+                return False
+
+        except Exception as e:
+            print(f"❌ 自动关闭摄像头AI时发生异常: {e}")
+            self.root.after(0, lambda: self.camera_ai_status_var.set("自动设置异常"))
+            self.root.after(0, lambda: self.camera_ai_status_label.configure(foreground="red"))
+            self.camera_ai_disabled = True  # 标记为已处理，避免重试
+            return False # Continue execution
+    
+    def apply_camera_mode(self):
+        """应用摄像头工作模式设置"""
+        if not self.camera_ai_controller:
+            # 从RTSP基础IP提取摄像头IP
+            base_ip = self.rtsp_base_ip_var.get()
+            if base_ip:
+                self.camera_ai_controller = CameraAIController(camera_ip=base_ip)
+            else:
+                messagebox.showerror("错误", "请先设置RTSP基础IP地址！")
+                return
+        
+        mode_name = self.camera_mode_var.get()
+        mode_map = {"自动切换": 0, "双路输出": 1, "融合模式": 2}
+        mode_value = mode_map.get(mode_name, 1)  # 默认双路输出
+        
+        def apply_mode():
+            try:
+                self.status_var.set(f"正在设置摄像头模式为{mode_name}...")
+                self.root.update()
+                
+                success, response, error = self.camera_ai_controller.set_work_mode(mode_value)
+                
+                if success:
+                    messagebox.showinfo("成功", f"摄像头工作模式已设置为: {mode_name}")
+                    print(f"✅ 摄像头工作模式已设置为: {mode_name}")
+                    
+                    # 根据模式更新RTSP URL建议
+                    base_ip = self.rtsp_base_ip_var.get()
+                    if mode_value == 0:  # 自动切换
+                        suggested_rgb = f"rtsp://{base_ip}/ch0/stream2"
+                        suggested_ir = f"rtsp://{base_ip}/ch1/stream0"
+                    elif mode_value == 1:  # 双路输出
+                        suggested_rgb = f"rtsp://{base_ip}/ch0/stream0"
+                        suggested_ir = f"rtsp://{base_ip}/ch1/stream0"
+                    elif mode_value == 2:  # 融合模式
+                        suggested_rgb = f"rtsp://{base_ip}/ch0/stream1"
+                        suggested_ir = f"rtsp://{base_ip}/ch1/stream0"
+                    
+                    # 询问是否更新RTSP URL
+                    if messagebox.askyesno("更新RTSP URL", 
+                                         f"是否根据{mode_name}模式更新RTSP流地址？\n\n"
+                                         f"建议RGB: {suggested_rgb}\n"
+                                         f"建议IR: {suggested_ir}"):
+                        self.rgb_source_var.set(suggested_rgb)
+                        self.ir_source_var.set(suggested_ir)
+                        print(f"✅ RTSP URL已更新为{mode_name}模式")
+                        
+                else:
+                    messagebox.showerror("错误", f"设置摄像头模式失败: {error}")
+                    
+            except Exception as e:
+                messagebox.showerror("错误", f"摄像头模式设置异常: {e}")
+            
+            self.status_var.set("就绪")
+        
+        # 在新线程中执行，避免阻塞GUI
+        threading.Thread(target=apply_mode, daemon=True).start()
+    
+    def test_camera_ping(self):
+        """测试摄像头Ping连通性"""
+        base_ip = self.rtsp_base_ip_var.get()
+        if not base_ip:
+            messagebox.showerror("错误", "请先设置RTSP基础IP地址！")
+            return
+        
+        def ping_test():
+            try:
+                self.status_var.set("正在进行Ping测试...")
+                self.root.update()
+                
+                if not self.camera_ai_controller:
+                    self.camera_ai_controller = CameraAIController(camera_ip=base_ip)
+                
+                success = self.camera_ai_controller.ping_camera()
+                
+                if success:
+                    messagebox.showinfo("Ping测试", f"✅ Ping测试成功！\n摄像头 {base_ip} 网络可达")
+                else:
+                    messagebox.showerror("Ping测试", f"❌ Ping测试失败！\n摄像头 {base_ip} 网络不可达\n\n请检查:\n1. 摄像头是否开机\n2. 网络连接是否正常\n3. IP地址是否正确")
+                    
+            except Exception as e:
+                messagebox.showerror("错误", f"Ping测试异常: {e}")
+            
+            self.status_var.set("就绪")
+        
+        threading.Thread(target=ping_test, daemon=True).start()
+    
+    def test_camera_port(self):
+        """测试摄像头控制端口连通性"""
+        base_ip = self.rtsp_base_ip_var.get()
+        if not base_ip:
+            messagebox.showerror("错误", "请先设置RTSP基础IP地址！")
+            return
+        
+        def port_test():
+            try:
+                self.status_var.set("正在测试控制端口...")
+                self.root.update()
+                
+                if not self.camera_ai_controller:
+                    self.camera_ai_controller = CameraAIController(camera_ip=base_ip)
+                
+                success = self.camera_ai_controller.test_network_connection()
+                
+                if success:
+                    messagebox.showinfo("端口测试", f"✅ 端口测试成功！\n控制端口 {base_ip}:8067 可达\n摄像头控制服务正常")
+                else:
+                    messagebox.showerror("端口测试", f"❌ 端口测试失败！\n控制端口 {base_ip}:8067 不可达\n\n可能原因:\n1. 摄像头控制服务未启动\n2. 端口被防火墙阻止\n3. 摄像头固件问题")
+                    
+            except Exception as e:
+                messagebox.showerror("错误", f"端口测试异常: {e}")
+            
+            self.status_var.set("就绪")
+        
+        threading.Thread(target=port_test, daemon=True).start()
+    
+    def test_device(self):
+        """测试计算设备"""
+        device = self.detect_best_device()
+        try:
+            import torch
+            if device == "cpu":
+                self.device_status_var.set("CPU")
+                self.device_status_label.configure(foreground="orange")
+                messagebox.showinfo("设备检测", "当前使用CPU进行推理\n\n如果有GPU，请检查：\n1. CUDA是否正确安装\n2. PyTorch是否支持CUDA\n3. GPU驱动是否正常")
+            else:
+                gpu_name = torch.cuda.get_device_name(int(device))
+                gpu_memory = torch.cuda.get_device_properties(int(device)).total_memory / (1024**3)
+                self.device_status_var.set(f"GPU-{device}: {gpu_name[:20]}...")
+                self.device_status_label.configure(foreground="green")
+                messagebox.showinfo("设备检测", f"✅ GPU检测成功！\n\n设备: {gpu_name}\n内存: {gpu_memory:.1f}GB\n\n推理将使用GPU加速")
+        except Exception as e:
+            self.device_status_var.set("检测失败")
+            self.device_status_label.configure(foreground="red")
+            messagebox.showerror("错误", f"设备检测失败: {e}")
+    
+    def test_radar(self):
+        """测试雷达连接"""
+        port = self.radar_port_var.get()
+        if not port:
+            messagebox.showerror("错误", "请输入雷达串口号！")
+            return
+        
+        def test_connection():
+            try:
+                self.status_var.set("正在测试雷达连接...")
+                self.root.update()
+                
+                # 创建临时雷达处理器测试连接
+                test_radar = RadarProcessor(port)
+                success = test_radar.connect()
+                
+                if success:
+                    messagebox.showinfo("成功", f"雷达连接成功！\n串口: {port}")
+                    self.radar_status_var.set("连接正常")
+                    self.radar_status_label.configure(foreground="green")
+                    
+                    # 等待一些数据来验证
+                    time.sleep(2)
+                    test_data = test_radar.get_latest_data()
+                    if test_data:
+                        messagebox.showinfo("数据测试", f"成功接收到雷达数据！\n目标数量: {len(test_data['targets'])}")
+                    
+                    test_radar.disconnect()
+                else:
+                    messagebox.showerror("错误", f"雷达连接失败！\n串口: {port}")
+                    self.radar_status_var.set("连接失败")
+                    self.radar_status_label.configure(foreground="red")
+                    
+            except Exception as e:
+                messagebox.showerror("错误", f"雷达测试失败: {e}")
+                self.radar_status_var.set("测试失败")
+                self.radar_status_label.configure(foreground="red")
+            
+            self.status_var.set("就绪")
+        
+        # 启动测试线程
+        test_thread = threading.Thread(target=test_connection, daemon=True)
+        test_thread.start()
+    
+    def on_rtsp_mode_changed(self, event=None):
+        """RTSP模式改变时的回调"""
+        self.apply_rtsp_settings()
+    
+    def apply_rtsp_settings(self):
+        """应用RTSP设置"""
+        mode = self.rtsp_mode_var.get()
+        base_ip = self.rtsp_base_ip_var.get()
+        
+        if mode == "自定义":
+            # 自定义模式，用户可以手动输入
+            self.rgb_entry.config(state="normal")
+            self.ir_entry.config(state="normal")
+            return
+        
+        # 根据模式设置相应的RTSP URL
+        rtsp_configs = {
+            "可见光": {
+                "rgb": f"rtsp://{base_ip}/ch0/stream0",
+                "ir": f"rtsp://{base_ip}/ch1/stream0"
+            },
+            "融合": {
+                "rgb": f"rtsp://{base_ip}/ch0/stream1",
+                "ir": f"rtsp://{base_ip}/ch1/stream0"
+            },
+            "自动": {
+                "rgb": f"rtsp://{base_ip}/ch0/stream2",
+                "ir": f"rtsp://{base_ip}/ch1/stream0"
+            },
+            "红外": {
+                "rgb": f"rtsp://{base_ip}/ch1/stream0",
+                "ir": f"rtsp://{base_ip}/ch1/stream0"
+            }
+        }
+        
+        if mode in rtsp_configs:
+            config = rtsp_configs[mode]
+            self.rgb_source_var.set(config["rgb"])
+            self.ir_source_var.set(config["ir"])
+            
+            # 启用输入框以便用户可以微调
+            self.rgb_entry.config(state="normal")
+            self.ir_entry.config(state="normal")
+            
+            # 更新状态
+            self.status_var.set(f"已设置{mode}模式RTSP流")
+    
+    def test_rtsp_stream(self, stream_type):
+        """测试RTSP流连接"""
+        if stream_type == "RGB":
+            url = self.rgb_source_var.get()
+        else:
+            url = self.ir_source_var.get()
+        
+        if not url:
+            messagebox.showerror("错误", f"{stream_type}流URL不能为空！")
+            return
+        
+        # 在新线程中测试连接
+        def test_connection():
+            try:
+                self.status_var.set(f"正在测试{stream_type}流连接...")
+                self.root.update()
+                
+                # 使用优化的RTSCapture进行测试
+                cap = RTSCapture.create(url)
+                cap.start_read()
+                
+                if cap.isOpened():
+                    # 等待一小段时间让后台线程启动
+                    time.sleep(1)
+                    
+                    # 尝试读取一帧
+                    ret, frame = cap.read_latest_frame()
+                    if ret and frame is not None:
+                        messagebox.showinfo("成功", f"{stream_type}流连接成功！\n分辨率: {frame.shape[1]}x{frame.shape[0]}\nRTSCapture优化已启用")
+                        self.connection_status_var.set(f"{stream_type}连接正常(RTSCapture)")
+                        self.connection_status_label.configure(foreground="green")
+                    else:
+                        messagebox.showerror("错误", f"{stream_type}流无法读取帧！")
+                        self.connection_status_var.set(f"{stream_type}读取失败")
+                        self.connection_status_label.configure(foreground="orange")
+                else:
+                    messagebox.showerror("错误", f"{stream_type}流连接失败！\n请检查URL和网络连接。")
+                    self.connection_status_var.set(f"{stream_type}连接失败")
+                    self.connection_status_label.configure(foreground="red")
+                
+                cap.release()
+                
+            except Exception as e:
+                messagebox.showerror("错误", f"{stream_type}流测试失败: {e}")
+                self.connection_status_var.set(f"{stream_type}测试失败")
+                self.connection_status_label.configure(foreground="red")
+            
+            self.status_var.set("就绪")
+        
+        # 启动测试线程
+        test_thread = threading.Thread(target=test_connection, daemon=True)
+        test_thread.start()
+    
+    def reconnect_rtsp(self):
+        """重新连接RTSP流"""
+        if not self.is_running:
+            messagebox.showwarning("警告", "请先开始检测！")
+            return
+        
+        self.status_var.set("正在重新连接RTSP流...")
+        self.root.update()
+        
+        # 在新线程中执行重连，避免阻塞GUI
+        def reconnect_thread():
+            try:
+                success = self.attempt_reconnect()
+                
+                if success:
+                    messagebox.showinfo("成功", "RTSP流重连成功！")
+                else:
+                    messagebox.showerror("错误", "RTSP流重连失败！\n请检查网络连接和RTSP URL。")
+                    
+            except Exception as e:
+                messagebox.showerror("错误", f"重连异常: {e}")
+        
+        # 启动重连线程
+        thread = threading.Thread(target=reconnect_thread, daemon=True)
+        thread.start()
+    
+    def detect_best_device(self):
+        """检测最佳设备（GPU或CPU）"""
+        try:
+            import torch
+            
+            # 检查CUDA是否可用
+            if torch.cuda.is_available():
+                gpu_count = torch.cuda.device_count()
+                print(f"检测到 {gpu_count} 个GPU设备")
+                
+                # 检查GPU内存
+                for i in range(gpu_count):
+                    gpu_name = torch.cuda.get_device_name(i)
+                    gpu_memory = torch.cuda.get_device_properties(i).total_memory / (1024**3)  # GB
+                    print(f"GPU {i}: {gpu_name}, 内存: {gpu_memory:.1f}GB")
+                
+                # 选择第一个GPU
+                device = 0
+                print(f"✅ 使用GPU: {torch.cuda.get_device_name(0)}")
+                return device
+            else:
+                print("❌ CUDA不可用，使用CPU")
+                return "cpu"
+                
+        except ImportError:
+            print("❌ PyTorch未安装，使用CPU")
+            return "cpu"
+        except Exception as e:
+            print(f"❌ 设备检测失败: {e}，使用CPU")
+            return "cpu"
+    
+    def browse_model(self):
+        """浏览模型文件"""
+        filename = filedialog.askopenfilename(
+            title="选择模型文件",
+            filetypes=[("PyTorch模型", "*.pt"), ("所有文件", "*.*")]
+        )
+        if filename:
+            self.model_path_var.set(filename)
+    
+    def test_kafka(self):
+        """测试Kafka连接"""
+        if not KAFKA_AVAILABLE:
+            messagebox.showerror("错误", "Kafka库未安装！\n请运行: pip install kafka-python")
+            return
+        
+        try:
+            servers = self.kafka_servers_var.get()
+            topic = self.kafka_topic_var.get()
+            
+            # 创建临时生产者测试连接
+            test_producer = KafkaAlertProducer(servers, topic)
+            
+            if test_producer.is_connected:
+                # 发送测试消息
+                test_message = {
+                    'camera_id': self.camera_id_var.get(),
+                    'alert_type': 'test',
+                    'message': 'Kafka SCRAM-SHA-256认证连接测试',
+                    'test_time': datetime.now().isoformat()
+                }
+                
+                success = test_producer.send_alert(test_message)
+                if success:
+                    messagebox.showinfo("成功", "Kafka SCRAM-SHA-256认证连接测试成功！")
+                    self.kafka_status_var.set("连接正常(SCRAM-SHA-256)")
+                    self.kafka_status_label.configure(foreground="green")
+                else:
+                    messagebox.showerror("错误", "Kafka消息发送失败！")
+                    
+                test_producer.close()
+            else:
+                messagebox.showerror("错误", "无法连接到Kafka服务器！\n请检查SCRAM-SHA-256认证配置")
+                self.kafka_status_var.set("连接失败")
+                self.kafka_status_label.configure(foreground="red")
+                
+        except Exception as e:
+            messagebox.showerror("错误", f"Kafka测试失败: {e}")
+    
+    def toggle_camera_ai(self):
+        """切换摄像头AI状态（快速按钮）"""
+        if not self.camera_ai_controller:
+            # 从RTSP基础IP提取摄像头IP
+            base_ip = self.rtsp_base_ip_var.get()
+            if base_ip:
+                self.camera_ai_controller = CameraAIController(camera_ip=base_ip)
+            else:
+                messagebox.showerror("错误", "请先设置RTSP基础IP地址！")
+                return
+        
+        # 根据当前状态切换
+        current_enabled = self.camera_ai_enabled_var.get()
+        new_state = not current_enabled
+        
+        def toggle_ai():
+            try:
+                self.status_var.set("正在切换摄像头AI状态...")
+                self.root.update()
+                
+                if new_state:
+                    # 启用AI
+                    success, response, error = self.camera_ai_controller.enable_ai()
+                    if success:
+                        self.camera_ai_status_var.set("AI启用命令已发送")
+                        self.camera_ai_status_label.configure(foreground="blue")
+                        
+                        # 验证AI状态
+                        verification_success = self.camera_ai_controller.verify_ai_status_after_set(expected_disabled=False)
+                        if verification_success:
+                            self.camera_ai_enabled_var.set(True)
+                            self.camera_ai_status_var.set("AI已启用")
+                            self.camera_ai_status_label.configure(foreground="blue")
+                            self.camera_ai_button.configure(text="关闭摄像头AI")
+                            self.camera_ai_disabled = False
+                            messagebox.showinfo("成功", "摄像头AI功能已启用")
+                        else:
+                            messagebox.showwarning("警告", "AI启用命令已发送，但状态验证失败")
+                    else:
+                        messagebox.showerror("错误", f"启用摄像头AI失败: {error}")
+                else:
+                    # 关闭AI
+                    success, response, error = self.camera_ai_controller.disable_ai()
+                    if success:
+                        self.camera_ai_status_var.set("AI关闭命令已发送")
+                        self.camera_ai_status_label.configure(foreground="blue")
+                        
+                        # 验证AI状态
+                        verification_success = self.camera_ai_controller.verify_ai_status_after_set(expected_disabled=True)
+                        if verification_success:
+                            self.camera_ai_enabled_var.set(False)
+                            self.camera_ai_status_var.set("AI已关闭")
+                            self.camera_ai_status_label.configure(foreground="green")
+                            self.camera_ai_button.configure(text="启用摄像头AI")
+                            self.camera_ai_disabled = True
+                            messagebox.showinfo("成功", "摄像头AI功能已关闭")
+                        else:
+                            self.camera_ai_disabled = True  # 假设成功
+                            messagebox.showwarning("警告", "AI关闭命令已发送，但状态验证失败")
+                    else:
+                        messagebox.showerror("错误", f"关闭摄像头AI失败: {error}")
+                        
+            except Exception as e:
+                messagebox.showerror("错误", f"切换摄像头AI状态异常: {e}")
+            
+            self.status_var.set("就绪")
+        
+        # 在新线程中执行，避免阻塞GUI
+        threading.Thread(target=toggle_ai, daemon=True).start()
+    
+    # ==================== Kafka消息格式定义 ====================
+    
+    # 预警级别常量
+    ALERT_LEVELS = {
+        'HIGH': 'high',
+        'MEDIUM': 'medium', 
+        'LOW': 'low',
+        'INFO': 'info'
+    }
+    
+    # 预警类型常量
+    ALERT_TYPES = {
+        'SECURITY_DETECTION': 'security_detection',
+        'SPEED_VIOLATION': 'speed_violation',
+        'SYSTEM_ERROR': 'system_error',
+        'MAINTENANCE': 'maintenance'
+    }
+    
+    # 检测类别常量 - 更新为新的6类异常行为
+    DETECTION_CLASSES = {
+        'NORMAL': 'normal',                    # 0: normal
+        'CLIMB_OVER': 'climb over',            # 1: climb over  
+        'TAILGATING': 'tailgating',            # 2: tailgating
+        'CARRYBABY': 'carrybaby',              # 3: carrybaby
+        'ABNORMAL_REVERSE': 'Abnormal reverse', # 4: Abnormal reverse
+        'REVERSE_TAILGATING': 'Reverse Tailgating', # 5: Reverse Tailgating
+        'CRAWL': 'crawl'                       # 6: crawl
+    }
+    
+    # 预警级别映射 - 分为两个优先级
+    CLASS_TO_ALERT_LEVEL = {
+        'normal': 'info',
+        # 第一优先级：carrybaby, climb over, tailgating
+        'carrybaby': 'high',
+        'climb over': 'high',
+        'tailgating': 'high',
+        # 第二优先级：其他异常行为
+        'Abnormal reverse': 'medium',
+        'Reverse Tailgating': 'medium',
+        'crawl': 'medium'
+    }
+    
+    # 预警描述映射 - 更新为新的6类异常行为
+    CLASS_TO_DESCRIPTION = {
+        'normal': '正常行为',
+        'climb over': '攀爬翻越',
+        'tailgating': '尾随行为',
+        'carrybaby': '抱婴儿',
+        'Abnormal reverse': '异常反向',
+        'Reverse Tailgating': '反向尾随',
+        'crawl': '爬行行为'
+    }
+    
+    # 详细消息映射 - 更新为新的6类异常行为
+    CLASS_TO_DETAILED_MESSAGE = {
+        'normal': '检测到正常行为',
+        'climb over': '检测到人员正在攀爬翻越围栏或障碍物',
+        'tailgating': '检测到人员尾随他人通过安检门',
+        'carrybaby': '检测到人员携带婴儿通过',
+        'Abnormal reverse': '检测到人员异常反向移动',
+        'Reverse Tailgating': '检测到人员反向尾随行为',
+        'crawl': '检测到人员爬行通过'
+    }
+    
+    @classmethod
+    def create_standard_detection_object(cls, class_name, confidence, bbox, additional_data=None):
+        """
+        创建标准检测对象
+        
+        Args:
+            class_name (str): 检测类别名称
+            confidence (float): 置信度 (0-1)
+            bbox (list): 边界框 [x1, y1, x2, y2]
+            additional_data (dict): 附加数据
+            
+        Returns:
+            dict: 标准检测对象
+        """
+        detection_obj = {
+            'class_name': class_name,
+            'confidence': float(confidence),
+            'bbox': [float(x) for x in bbox],
+            'alert_level': cls.CLASS_TO_ALERT_LEVEL.get(class_name, 'medium'),
+            'description': cls.CLASS_TO_DESCRIPTION.get(class_name, class_name),
+            'message': cls.CLASS_TO_DETAILED_MESSAGE.get(class_name, f'检测到{class_name}行为')  # 改为message字段
+        }
+        
+        if additional_data:
+            detection_obj.update(additional_data)
+            
+        return detection_obj
+    
+    @classmethod
+    def create_standard_alert_message(cls, camera_id, detections, camera_location="未指定", additional_data=None):
+        """
+        创建标准预警消息
+        
+        Args:
+            camera_id (str): 摄像头ID
+            detections (list): 检测对象列表
+            camera_location (str): 摄像头位置
+            additional_data (dict): 附加数据
+            
+        Returns:
+            dict: 标准预警消息
+        """
+        # 生成全局消息
+        if detections:
+            messages = [det.get('message', det.get('description', det['class_name'])) for det in detections]
+            global_message = f"检测到{len(detections)}个异常行为：" + "、".join(messages)
+        else:
+            global_message = "未检测到异常行为"
+        
+        # 获取当前时间戳
+        current_time = time.time()
+        timestamp_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        alert_message = {
+            # 基础信息
+            'camera_id': camera_id,
+            'camera_location': camera_location,
+            'alert_type': cls.ALERT_TYPES['SECURITY_DETECTION'],
+            'timestamp': timestamp_str,  # 字符串格式时间戳
+            'frame_timestamp': current_time,  # 浮点数时间戳
+            'system_version': '1.0.0',
+            
+            # 检测信息
+            'detections': detections,
+            'total_detections': len(detections),
+            'message': global_message,
+            'confidence_threshold': 0.7  # 默认值，会在发送时更新为实际值
+        }
+        
+        if additional_data:
+            alert_message.update(additional_data)
+            
+        return alert_message
+    
+    def should_send_alert(self, class_name):
+        """判断是否应该发送预警（冷却时间控制）"""
+        # 只有异常行为才发送预警，正常行为不发送
+        alert_classes = ['climb over', 'tailgating', 'carrybaby', 'Abnormal reverse', 'Reverse Tailgating', 'crawl']
+        if class_name not in alert_classes:
+            return False
+        
+        current_time = time.time()
+        last_time = self.last_alert_time.get(class_name, 0)
+        
+        if current_time - last_time >= self.alert_cooldown:
+            self.last_alert_time[class_name] = current_time
+            return True
+        
+        return False
+    
+    def send_kafka_alert(self, detections, rgb_frame=None, ir_frame=None):
+        """发送Kafka预警消息 - 使用标准化消息格式"""
+        if not self.kafka_producer or not self.kafka_producer.is_connected:
+            return False
+        
+        # 筛选需要预警的检测结果并转换为标准格式
+        alert_detections = []
+        for detection in detections:
+            class_name = detection['class_name']
+            if self.should_send_alert(class_name):
+                # 创建裁剪图片
+                detection_snapshot = None
+                if rgb_frame is not None and ir_frame is not None:
+                    detection_snapshot = self._create_detection_snapshot(
+                        rgb_frame, ir_frame, detection['bbox'], class_name
+                    )
+                
+                # 使用标准化方法创建检测对象
+                standard_detection = self.create_standard_detection_object(
+                    class_name=class_name,
+                    confidence=detection['confidence'],
+                    bbox=detection['bbox'],
+                    additional_data={'detection_snapshot': detection_snapshot} if detection_snapshot else None
+                )
+                
+                alert_detections.append(standard_detection)
+        
+        if not alert_detections:
+            return False
+        
+        # 创建完整场景图片
+        snapshot = None
+        if rgb_frame is not None and ir_frame is not None:
+            snapshot = self._create_full_scene_snapshot(rgb_frame, ir_frame, detections)
+        
+        # 使用标准化方法创建预警消息
+        alert_message = self.create_standard_alert_message(
+            camera_id=self.camera_id_var.get(),
+            detections=alert_detections,
+            camera_location=self.camera_location_var.get(),
+            additional_data={
+                'snapshot': snapshot,
+                'confidence_threshold': self.confidence_var.get()  # 使用实际置信度值
+            }
+        )
+        
+        # 发送消息
+        success = self.kafka_producer.send_alert(alert_message)
+        
+        if success:
+            self.stats['kafka_sent'] += 1
+            self.log_kafka_message(f"✅ 标准预警已发送: {alert_message['message']}")
+        else:
+            self.stats['kafka_failed'] += 1
+            self.log_kafka_message(f"❌ 预警发送失败")
+        
+        return success
+    
+    def get_alert_level(self, class_name):
+        """获取预警级别 - 使用标准化映射"""
+        return self.CLASS_TO_ALERT_LEVEL.get(class_name, 'medium')
+    
+    def get_alert_description(self, class_name):
+        """获取预警描述 - 使用标准化映射"""
+        return self.CLASS_TO_DESCRIPTION.get(class_name, class_name)
+    
+    def _get_detailed_message(self, class_name):
+        """获取详细的行为描述消息 - 使用标准化映射"""
+        return self.CLASS_TO_DETAILED_MESSAGE.get(class_name, f'检测到{class_name}行为')
+    
+    def _create_detection_snapshot(self, rgb_frame, ir_frame, bbox, class_name):
+        """创建检测结果的裁剪图片快照"""
+        try:
+            from realtime_dual_modal_detection import encode_image_to_base64
+            
+            x1, y1, x2, y2 = map(int, bbox)
+            
+            # 确保坐标在图像范围内
+            h, w = rgb_frame.shape[:2]
+            x1, x2 = max(0, x1), min(w, x2)
+            y1, y2 = max(0, y1), min(h, y2)
+            
+            # 裁剪图片
+            rgb_crop = rgb_frame[y1:y2, x1:x2]
+            ir_crop = ir_frame[y1:y2, x1:x2]
+            
+            # 编码为Base64
+            rgb_base64, rgb_size = encode_image_to_base64(rgb_crop, 85, (640, 480))
+            ir_base64, ir_size = encode_image_to_base64(ir_crop, 85, (640, 480))
+            
+            return {
+                "rgb_crop_base64": rgb_base64,
+                "ir_crop_base64": ir_base64,
+                "crop_size": [rgb_size[0], rgb_size[1]],
+                "image_format": "jpeg",
+                "image_quality": 85,
+                "crop_region": [float(x1), float(y1), float(x2), float(y2)]
+            }
+        except Exception as e:
+            print(f"创建检测快照失败: {e}")
+            return None
+    
+    def _create_full_scene_snapshot(self, rgb_frame, ir_frame, detections):
+        """创建完整场景图片快照"""
+        try:
+            from realtime_dual_modal_detection import encode_image_to_base64, create_annotated_frame
+            
+            # 创建带有检测框的标注图片
+            rgb_annotated = create_annotated_frame(rgb_frame, detections)
+            ir_annotated = create_annotated_frame(ir_frame, detections)
+            
+            # 编码为Base64
+            rgb_base64, rgb_size = encode_image_to_base64(rgb_annotated, 75, (640, 480))
+            ir_base64, ir_size = encode_image_to_base64(ir_annotated, 75, (640, 480))
+            
+            return {
+                "rgb_image_base64": rgb_base64,
+                "ir_image_base64": ir_base64,
+                "image_format": "jpeg",
+                "image_size": [rgb_size[0], rgb_size[1]],
+                "image_quality": 75,
+                "has_annotations": True,
+                "description": "完整场景图片，包含所有检测框"
+            }
+        except Exception as e:
+            print(f"创建场景快照失败: {e}")
+            return None
+    
+    def log_kafka_message(self, message):
+        """记录Kafka日志"""
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        log_message = f"[{timestamp}] {message}\n"
+        
+        self.kafka_log_text.insert(tk.END, log_message)
+        self.kafka_log_text.see(tk.END)
+        
+        # 限制日志长度
+        lines = self.kafka_log_text.get("1.0", tk.END).split('\n')
+        if len(lines) > 100:
+            self.kafka_log_text.delete("1.0", "10.0")
+    
+    def start_detection(self):
+        """开始检测"""
+        if self.is_running:
+            return
+        
+        # 验证配置
+        model_path = self.model_path_var.get()
+        if not model_path or not Path(model_path).exists():
+            messagebox.showerror("错误", "模型文件不存在！")
+            return
+        
+        try:
+            # 获取视频源
+            rgb_source = self.rgb_source_var.get()
+            ir_source = self.ir_source_var.get()
+            
+            # 验证RTSP URL格式
+            if not rgb_source or not ir_source:
+                messagebox.showerror("错误", "请设置RGB和IR视频源！")
+                return
+            
+            # 应用传输协议设置
+            rgb_source = self.build_rtsp_url_with_transport(rgb_source)
+            ir_source = self.build_rtsp_url_with_transport(ir_source)
+            
+            print(f"RGB源: {rgb_source}")
+            print(f"IR源: {ir_source}")
+            
+            # 尝试转换为整数（摄像头ID）
+            try:
+                rgb_source = int(rgb_source)
+            except ValueError:
+                pass
+            
+            try:
+                ir_source = int(ir_source)
+            except ValueError:
+                pass
+            
+            # 初始化预测器
+            self.status_var.set("正在加载模型...")
+            self.root.update()
+            
+            # 智能设备选择
+            device = self.detect_best_device()
+            print(f"使用设备: {device}")
+            
+            # 保存设备信息到实例变量
+            self.device = device
+            
+            # 更新设备状态显示
+            try:
+                import torch
+                if device == "cpu":
+                    self.device_status_var.set("CPU")
+                    self.device_status_label.configure(foreground="orange")
+                else:
+                    gpu_name = torch.cuda.get_device_name(int(device))
+                    self.device_status_var.set(f"GPU-{device}: {gpu_name[:20]}...")
+                    self.device_status_label.configure(foreground="green")
+            except:
+                self.device_status_var.set("未知设备")
+                self.device_status_label.configure(foreground="red")
+            
+            # 创建优化的DualModalPredictor - 48GB显卡原生分辨率优化
+            print("🔧 正在初始化双模态检测器...")
+            self.predictor = DualModalPredictor(
+                model_path=model_path,
+                device=device
+                # 移除imgsz参数，让预测器自动处理原生分辨率
+            )
+            
+            # GPU最大化优化设置
+            if device != "cpu":
+                try:
+                    import torch
+                    
+                    # 启用最大GPU性能
+                    torch.backends.cudnn.benchmark = True  # 启用cuDNN基准测试
+                    torch.backends.cudnn.enabled = True
+                    torch.backends.cudnn.deterministic = False  # 优先性能而非确定性
+                    torch.backends.cudnn.allow_tf32 = True  # 启用TF32（RTX30/40系列）
+                    
+                    # 平衡GPU内存使用
+                    torch.cuda.empty_cache()  # 清空缓存
+                    torch.cuda.set_per_process_memory_fraction(0.80)  # 使用80%的GPU内存
+                    
+                    # 启用多流并行处理
+                    torch.cuda.set_sync_debug_mode(0)  # 禁用同步调试以提高性能
+                    
+                    # 获取GPU信息
+                    gpu_name = torch.cuda.get_device_name(0)
+                    gpu_memory = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+                    
+                    print("✅ GPU最大化优化设置已启用")
+                    print(f"🎯 GPU: {gpu_name}")
+                    print(f"🎯 总内存: {gpu_memory:.1f}GB")
+                    print(f"🎯 可用内存: {gpu_memory * 0.95:.1f}GB")
+                    
+                    # 48GB显卡适度预分配GPU内存
+                    # 修复：使用32的倍数尺寸，避免维度对齐问题
+                    dummy_tensor = torch.zeros(8, 6, 1920, 1088, device=device, dtype=torch.float16)   # 1088 = 34*32
+                    dummy_tensor2 = torch.zeros(4, 3, 1280, 736, device=device, dtype=torch.float32)   # 736 = 23*32
+                    del dummy_tensor, dummy_tensor2
+                    torch.cuda.empty_cache()
+                    
+                    # 预热推理管道（修复尺寸对齐）
+                    print("🔥 预热推理管道（修复尺寸对齐）...")
+                    dummy_rgb = torch.zeros(1, 3, 1088, 1920, device=device, dtype=torch.float32)  # 32的倍数
+                    dummy_ir = torch.zeros(1, 3, 736, 1280, device=device, dtype=torch.float32)    # 32的倍数
+                    del dummy_rgb, dummy_ir
+                    torch.cuda.empty_cache()
+                    
+                except Exception as e:
+                    print(f"⚠️ GPU优化设置失败: {e}")
+            
+            print("🎯 双模态检测器初始化完成 - 已优化为最大GPU利用率和分辨率对齐")
+            
+            # 启用48GB显卡专用优化
+            self.optimize_for_48gb_gpu()
+            
+            # 初始化雷达处理器
+            if self.radar_enabled_var.get():
+                try:
+                    self.radar_processor = RadarProcessor(self.radar_port_var.get())
+                    radar_success = self.radar_processor.connect()
+                    if radar_success:
+                        self.radar_enabled = True
+                        self.radar_status_var.set("已连接")
+                        self.radar_status_label.configure(foreground="green")
+                        print("雷达监测已启用")
+                    else:
+                        self.radar_enabled = False
+                        self.radar_status_var.set("连接失败")
+                        self.radar_status_label.configure(foreground="red")
+                        messagebox.showwarning("警告", "雷达连接失败，将继续进行双模态检测")
+                except Exception as e:
+                    self.radar_enabled = False
+                    self.radar_status_var.set("初始化失败")
+                    self.radar_status_label.configure(foreground="red")
+                    messagebox.showwarning("警告", f"雷达初始化失败: {e}")
+            else:
+                self.radar_enabled = False
+                self.radar_status_var.set("已禁用")
+                self.radar_status_label.configure(foreground="gray")
+            
+            # 初始化Kafka生产者
+            if KAFKA_AVAILABLE:
+                self.kafka_producer = KafkaAlertProducer(
+                    self.kafka_servers_var.get(),
+                    self.kafka_topic_var.get()
+                )
+                
+                if self.kafka_producer.is_connected:
+                    self.kafka_status_var.set("已连接(SCRAM-SHA-256)")
+                    self.kafka_status_label.configure(foreground="green")
+                    self.log_kafka_message("Kafka生产者已连接(SCRAM-SHA-256认证)")
+                else:
+                    self.kafka_status_var.set("连接失败")
+                    self.kafka_status_label.configure(foreground="red")
+                    self.log_kafka_message("Kafka连接失败，预警将无法发送")
+            
+            # 初始化摄像头/RTSP流
+            self.status_var.set("正在连接视频流...")
+            self.root.update()
+            
+            # 自动关闭摄像头AI功能（在连接RTSP流之前）
+            if isinstance(rgb_source, str) and rgb_source.startswith('rtsp://'):
+                print("🤖 检测到RTSP流，尝试自动关闭摄像头AI...")
+                ai_disabled = self.auto_disable_camera_ai()
+                if ai_disabled:
+                    print("✅ 摄像头AI已自动关闭，避免与系统检测冲突")
+                    # 等待一下让摄像头处理命令
+                    time.sleep(2)
+                else:
+                    print("⚠️ 摄像头AI自动关闭失败，继续连接流（可能存在检测冲突）")
+            
+            # 创建优化的 RTSCapture 对象 - 解决延迟和花屏问题
+            print("🚀 创建RTSCapture对象，启用多线程优化...")
+            self.rgb_cap = RTSCapture.create(rgb_source)
+            self.ir_cap = RTSCapture.create(ir_source)
+            
+            # 优化RTSP流设置 - 网络缓冲机制 + GPU硬件加速
+            if isinstance(rgb_source, str) and rgb_source.startswith('rtsp://'):
+                # GPU硬件加速解码设置
+                try:
+                    # 后端已在RTSCapture的__init__中设置
+                    
+                    # 启用GPU硬件加速解码
+                    if self.device != "cpu":
+                        try:
+                            # 尝试NVIDIA GPU硬件解码
+                            self.rgb_cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('H', '2', '6', '4'))
+                            # 启用硬件加速
+                            self.rgb_cap.set(cv2.CAP_PROP_HW_ACCELERATION, cv2.VIDEO_ACCELERATION_ANY)
+                            self.rgb_cap.set(cv2.CAP_PROP_HW_DEVICE, 0)  # 使用第一个GPU设备
+                            print("✅ RGB流已启用GPU硬件加速解码")
+                        except:
+                            # 回退到CPU解码
+                            self.rgb_cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('H', '2', '6', '4'))
+                            print("⚠️ RGB流回退到CPU解码")
+                    else:
+                        # CPU模式
+                        self.rgb_cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('H', '2', '6', '4'))
+                        print("✅ RGB流使用CPU解码")
+                        
+                except Exception as e:
+                    print(f"⚠️ RGB解码器设置失败: {e}")
+                
+                # 网络缓冲机制 - 100ms缓冲
+                try:
+                    # 计算100ms对应的帧数 (假设25fps)
+                    fps = 25
+                    buffer_ms = self.buffer_time_var.get()
+                    buffer_frames = max(2, int(fps * (buffer_ms / 1000.0)))
+                    self.rgb_cap.set(cv2.CAP_PROP_BUFFERSIZE, buffer_frames)
+                    print(f"✅ RGB网络缓冲设置为{buffer_frames}帧({buffer_ms}ms@{fps}fps)")
+                except Exception as e:
+                    print(f"⚠️ RGB缓冲区设置失败: {e}")
+                
+                # 设置分辨率和帧率
+                try:
+                    self.rgb_cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+                    self.rgb_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+                    self.rgb_cap.set(cv2.CAP_PROP_FPS, 25)
+                    print("✅ RGB流设置为1280x720@25fps")
+                except:
+                    print("⚠️ 使用RGB流默认参数")
+                
+                # 网络优化参数
+                try:
+                    self.rgb_cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 15000)  # 15秒连接超时
+                    self.rgb_cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 8000)   # 8秒读取超时
+                    # 启用网络优化
+                    print("✅ RGB网络参数已优化")
+                except:
+                    print("⚠️ 无法设置RGB网络参数")
+                
+            if isinstance(ir_source, str) and ir_source.startswith('rtsp://'):
+                # GPU硬件加速解码设置
+                try:
+                    # 后端已在RTSCapture的__init__中设置
+                    
+                    # 启用GPU硬件加速解码
+                    if self.device != "cpu":
+                        try:
+                            # 尝试NVIDIA GPU硬件解码
+                            self.ir_cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('H', '2', '6', '4'))
+                            # 启用硬件加速
+                            self.ir_cap.set(cv2.CAP_PROP_HW_ACCELERATION, cv2.VIDEO_ACCELERATION_ANY)
+                            self.ir_cap.set(cv2.CAP_PROP_HW_DEVICE, 0)  # 使用第一个GPU设备
+                            print("✅ IR流已启用GPU硬件加速解码")
+                        except:
+                            # 回退到CPU解码
+                            self.ir_cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('H', '2', '6', '4'))
+                            print("⚠️ IR流回退到CPU解码")
+                    else:
+                        # CPU模式
+                        self.ir_cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('H', '2', '6', '4'))
+                        print("✅ IR流使用CPU解码")
+                        
+                except Exception as e:
+                    print(f"⚠️ IR解码器设置失败: {e}")
+                
+                # 网络缓冲机制 - 100ms缓冲
+                try:
+                    # 计算100ms对应的帧数 (假设25fps)
+                    fps = 25
+                    buffer_ms = self.buffer_time_var.get()
+                    buffer_frames = max(2, int(fps * (buffer_ms / 1000.0)))
+                    self.ir_cap.set(cv2.CAP_PROP_BUFFERSIZE, buffer_frames)
+                    print(f"✅ IR网络缓冲设置为{buffer_frames}帧({buffer_ms}ms@{fps}fps)")
+                except Exception as e:
+                    print(f"⚠️ IR缓冲区设置失败: {e}")
+                
+                # 设置分辨率和帧率
+                try:
+                    self.ir_cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+                    self.ir_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+                    self.ir_cap.set(cv2.CAP_PROP_FPS, 25)
+                    print("✅ IR流设置为1280x720@25fps")
+                except:
+                    print("⚠️ 使用IR流默认参数")
+                
+                # 网络优化参数
+                try:
+                    self.ir_cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 15000)  # 15秒连接超时
+                    self.ir_cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 8000)   # 8秒读取超时
+                    # 启用网络优化
+                    print("✅ IR网络参数已优化")
+                except:
+                    print("⚠️ 无法设置IR网络参数")
+            
+            if not self.rgb_cap.isOpened() or not self.ir_cap.isOpened():
+                error_msg = "无法连接视频流！\n"
+                if not self.rgb_cap.isOpened():
+                    error_msg += f"RGB流连接失败: {rgb_source}\n"
+                if not self.ir_cap.isOpened():
+                    error_msg += f"IR流连接失败: {ir_source}\n"
+                error_msg += "请检查RTSP URL和网络连接。"
+                messagebox.showerror("错误", error_msg)
+                return
+            
+            # 启动RTSCapture的多线程读取
+            print("🚀 启动RTSCapture多线程读取...")
+            self.rgb_cap.start_read()
+            self.ir_cap.start_read()
+            
+            # 等待后台线程启动
+            time.sleep(1)
+            
+            # 测试读取帧，允许多次重试
+            rgb_frame_success = False
+            ir_frame_success = False
+            max_retries = 5
+            
+            for retry in range(max_retries):
+                if not rgb_frame_success:
+                    ret_rgb, frame_rgb = self.rgb_cap.read_latest_frame()
+                    if ret_rgb and frame_rgb is not None:
+                        rgb_frame_success = True
+                        print(f"RGB流读取成功 (重试 {retry + 1}/{max_retries}) - RTSCapture")
+                
+                if not ir_frame_success:
+                    ret_ir, frame_ir = self.ir_cap.read_latest_frame()
+                    if ret_ir and frame_ir is not None:
+                        ir_frame_success = True
+                        print(f"IR流读取成功 (重试 {retry + 1}/{max_retries}) - RTSCapture")
+                
+                if rgb_frame_success and ir_frame_success:
+                    break
+                
+                if retry < max_retries - 1:
+                    print(f"帧读取失败，正在重试... ({retry + 1}/{max_retries})")
+                    time.sleep(1)  # 等待1秒后重试
+            
+            if not rgb_frame_success or not ir_frame_success:
+                error_msg = "视频流连接成功但无法读取帧！\n"
+                if not rgb_frame_success:
+                    error_msg += f"RGB流无法读取: {rgb_source}\n"
+                if not ir_frame_success:
+                    error_msg += f"IR流无法读取: {ir_source}\n"
+                error_msg += "可能是网络不稳定或视频编码问题。"
+                messagebox.showerror("错误", error_msg)
+                return
+            
+            # 更新连接状态
+            self.connection_status_var.set("视频流已连接")
+            self.connection_status_label.configure(foreground="green")
+            
+            # 启动检测
+            self.is_running = True
+            self.stats['start_time'] = time.time()
+            self.stats['frame_count'] = 0
+            self.stats['detection_count'] = 0
+            self.stats['alert_count'] = 0
+            self.stats['radar_alert_count'] = 0
+            self.stats['kafka_sent'] = 0
+            self.stats['kafka_failed'] = 0
+            
+            # 重置帧率统计
+            self.rgb_fps = 0.0
+            self.ir_fps = 0.0
+            self.processed_fps = 0.0
+            
+            # 更新按钮状态
+            self.start_button.config(state=tk.DISABLED)
+            self.stop_button.config(state=tk.NORMAL)
+            self.save_button.config(state=tk.NORMAL)
+            self.reconnect_button.config(state=tk.NORMAL)
+            
+            # 初始化HEVC错误计数器
+            self.hevc_error_count = 0
+            self.rgb_hevc_errors = 0
+            self.ir_hevc_errors = 0
+            
+            # 简化的预防性HEVC禁用
+            print("🛡️ 执行基础HEVC禁用...")
+            self.force_disable_hevc_decoder()
+            
+            # 启动检测线程
+            self.detection_thread = threading.Thread(target=self.detection_loop, daemon=True)
+            self.detection_thread.start()
+            
+            self.status_var.set("检测中...")
+            
+        except Exception as e:
+            messagebox.showerror("错误", f"启动检测失败: {e}")
+            self.stop_detection()
+    
+    def stop_detection(self):
+        """停止检测"""
+        self.is_running = False
+        
+        # 释放资源
+        if self.rgb_cap:
+            self.rgb_cap.release()
+            self.rgb_cap = None
+        
+        if self.ir_cap:
+            self.ir_cap.release()
+            self.ir_cap = None
+        
+        # 断开雷达连接
+        if self.radar_processor:
+            self.radar_processor.disconnect()
+            self.radar_processor = None
+            self.radar_enabled = False
+            self.radar_status_var.set("已断开")
+            self.radar_status_label.configure(foreground="red")
+        
+        # 关闭Kafka生产者
+        if self.kafka_producer:
+            self.kafka_producer.close()
+            self.kafka_producer = None
+            self.kafka_status_var.set("已断开")
+            self.kafka_status_label.configure(foreground="red")
+        
+        # 更新按钮状态
+        self.start_button.config(state=tk.NORMAL)
+        self.stop_button.config(state=tk.DISABLED)
+        self.save_button.config(state=tk.DISABLED)
+        self.reconnect_button.config(state=tk.DISABLED)
+        
+        # 更新连接状态
+        self.connection_status_var.set("已断开")
+        self.connection_status_label.configure(foreground="red")
+        
+        # 重置处理模式状态 - 独立处理模式
+        self.alignment_status_var.set("独立处理模式")
+        self.alignment_status_label.configure(foreground="gray")
+        
+        # 重置帧率统计
+        self.rgb_fps = 0.0
+        self.ir_fps = 0.0
+        self.processed_fps = 0.0
+        
+        # 重置HEVC错误计数器
+        self.hevc_error_count = 0
+        
+        self.status_var.set("已停止")
+    
+    def detection_loop(self):
+        """检测循环 - 使用配置文件的ultra_fast模式"""
+        consecutive_errors = 0
+        max_consecutive_errors = 20
+        
+        # 从配置文件获取批处理参数
+        batch_size = BATCH_CONFIG["batch_size"]
+        max_batch_size = BATCH_CONFIG["max_batch_size"]
+        batch_interval = BATCH_CONFIG["batch_interval"]
+        max_wait_time = BATCH_CONFIG["max_wait_time"]
+        force_timeout = BATCH_CONFIG["force_timeout"]
+        min_batch_trigger = BATCH_CONFIG["min_batch_trigger"]
+        enable_fast_mode = BATCH_CONFIG["enable_fast_mode"]
+        
+        # 批处理缓冲区
+        rgb_batch = []
+        ir_batch = []
+        original_frames = []
+        
+        # 帧率统计
+        rgb_fps_counter = 0
+        ir_fps_counter = 0
+        last_fps_time = time.time()
+        last_batch_process_time = time.time()
+        
+        # 记录最后有效帧，避免画面切换
+        last_valid_rgb = None
+        last_valid_ir = None
+        
+        # 性能监控
+        batch_count = 0
+        total_batch_time = 0
+        display_update_counter = 0
+        
+        print(f"🚀 Ultra Fast批处理启动:")
+        print(f"   批处理大小: {batch_size} (最大: {max_batch_size})")
+        print(f"   时间参数: 间隔={batch_interval*1000:.1f}ms, 等待={max_wait_time*1000:.1f}ms")
+        print(f"   快速模式: {enable_fast_mode}")
+        
+        while self.is_running:
+            try:
+                current_time = time.time()
+                
+                # 独立读取RGB和IR帧
+                rgb_frame = None
+                ir_frame = None
+                
+                # 快速读取RGB帧 - 使用RTSCapture优化读取
+                try:
+                    ret_rgb, rgb_frame = self.rgb_cap.read_latest_frame()
+                    if ret_rgb and rgb_frame is not None and rgb_frame.size > 0:
+                        # 180度翻转RGB帧
+                        rgb_frame = cv2.rotate(rgb_frame, cv2.ROTATE_180)
+                        
+                        # 简化验证，只做基本检查
+                        if rgb_frame.shape[0] > 10 and rgb_frame.shape[1] > 10:
+                            # 只进行最基础的质量检查，避免误判
+                            gray = cv2.cvtColor(rgb_frame, cv2.COLOR_BGR2GRAY)
+                            variance = np.var(gray)
+                            
+                            # 只有在方差极低时才认为是解码错误
+                            if variance > 0.1:  # 大大放宽标准
+                                rgb_fps_counter += 1
+                                last_valid_rgb = rgb_frame
+                            else:
+                                # 仅在极端情况下才认为是错误
+                                if not hasattr(self, 'rgb_hevc_errors'):
+                                    self.rgb_hevc_errors = 0
+                                self.rgb_hevc_errors += 1
+                                self.hevc_error_count += 1
+                                
+                                # 提高触发阈值，减少误触发
+                                if self.rgb_hevc_errors >= 20:  # 从5改为20
+                                    print(f"🔄 RGB流严重解码错误，清空缓冲区...")
+                                    self.simple_buffer_clear("RGB")
+                                    self.rgb_hevc_errors = 0
+                                
+                                rgb_frame = None
+                        else:
+                            rgb_frame = None
+                except Exception as e:
+                    rgb_frame = None
+                    # 如果连续失败，尝试跳过几帧
+                    if consecutive_errors > 10:  # 提高阈值
+                        try:
+                            for _ in range(3):
+                                self.rgb_cap.read_latest_frame()
+                        except:
+                            pass
+                
+                # 快速读取IR帧 - 使用RTSCapture优化读取
+                try:
+                    ret_ir, ir_frame = self.ir_cap.read_latest_frame()
+                    if ret_ir and ir_frame is not None and ir_frame.size > 0:
+                        # 180度翻转IR帧
+                        ir_frame = cv2.rotate(ir_frame, cv2.ROTATE_180)
+                        
+                        # 简化验证，只做基本检查
+                        if ir_frame.shape[0] > 10 and ir_frame.shape[1] > 10:
+                            # 只进行最基础的质量检查，避免误判
+                            gray = cv2.cvtColor(ir_frame, cv2.COLOR_BGR2GRAY)
+                            variance = np.var(gray)
+                            
+                            # 只有在方差极低时才认为是解码错误
+                            if variance > 0.1:  # 大大放宽标准
+                                ir_fps_counter += 1
+                                last_valid_ir = ir_frame
+                            else:
+                                # 仅在极端情况下才认为是错误
+                                if not hasattr(self, 'ir_hevc_errors'):
+                                    self.ir_hevc_errors = 0
+                                self.ir_hevc_errors += 1
+                                self.hevc_error_count += 1
+                                
+                                # 提高触发阈值，减少误触发
+                                if self.ir_hevc_errors >= 20:  # 从5改为20
+                                    print(f"🔄 IR流严重解码错误，清空缓冲区...")
+                                    self.simple_buffer_clear("IR")
+                                    self.ir_hevc_errors = 0
+                                
+                                ir_frame = None
+                        else:
+                            ir_frame = None
+                except Exception as e:
+                    ir_frame = None
+                    # 如果连续失败，尝试跳过几帧
+                    if consecutive_errors > 10:  # 提高阈值
+                        try:
+                            for _ in range(3):
+                                self.ir_cap.read_latest_frame()
+                        except:
+                            pass
+                
+                # 帧处理逻辑 - 修复画面切换问题
+                process_frame = False
+                final_rgb = None
+                final_ir = None
+                
+                if rgb_frame is not None and ir_frame is not None:
+                    # 双帧都有效，直接使用
+                    final_rgb = rgb_frame
+                    final_ir = ir_frame
+                    process_frame = True
+                elif rgb_frame is not None and last_valid_ir is not None:
+                    # 只有RGB帧，使用最后有效的IR帧
+                    final_rgb = rgb_frame
+                    final_ir = last_valid_ir
+                    process_frame = True
+                elif ir_frame is not None and last_valid_rgb is not None:
+                    # 只有IR帧，使用最后有效的RGB帧
+                    final_rgb = last_valid_rgb
+                    final_ir = ir_frame
+                    process_frame = True
+                elif last_valid_rgb is not None and last_valid_ir is not None:
+                    # 都没有新帧，但有历史帧，偶尔处理以保持显示
+                    if len(rgb_batch) == 0 and current_time - last_batch_process_time > 0.2:
+                        final_rgb = last_valid_rgb
+                        final_ir = last_valid_ir
+                        process_frame = True
+                
+                if process_frame and final_rgb is not None and final_ir is not None:
+                    # 重置错误计数
+                    consecutive_errors = 0
+                    
+                    try:
+                        # 保持原生分辨率，不进行对齐
+                        original_rgb = final_rgb.copy()
+                        original_ir = final_ir.copy()
+                        
+                        # 添加到批处理 - RGB和IR独立处理
+                        rgb_batch.append(original_rgb)
+                        ir_batch.append(original_ir)
+                        frame_info = {
+                            'original_rgb': original_rgb,
+                            'original_ir': original_ir,
+                            'rgb_size': original_rgb.shape[:2],  # 记录原始尺寸
+                            'ir_size': original_ir.shape[:2],    # 记录原始尺寸
+                        }
+                        original_frames.append(frame_info)
+                        
+                        self.stats['frame_count'] += 1
+                        
+                    except Exception as e:
+                        if not enable_fast_mode:
+                            print(f"帧预处理异常: {e}")
+                        continue
+                
+                # 优化的批处理触发逻辑 - 提升帧率
+                time_since_last_batch = current_time - last_batch_process_time
+                
+                # 更激进的触发条件，减少等待时间
+                should_process_batch = (
+                    len(rgb_batch) >= batch_size or  # 达到目标批处理大小
+                    len(rgb_batch) >= max_batch_size or  # 达到最大限制
+                    (len(rgb_batch) >= min_batch_trigger and time_since_last_batch >= max_wait_time) or  # 最小触发+等待
+                    (len(rgb_batch) >= 2 and time_since_last_batch >= force_timeout) or  # 降低强制处理阈值
+                    (len(rgb_batch) >= 1 and time_since_last_batch >= 0.1)  # 更激进的单帧处理
+                )
+                
+                if should_process_batch and len(rgb_batch) > 0:
+                    try:
+                        batch_start_time = time.time()
+                        
+                        if not enable_fast_mode:
+                            print(f"🚀 Ultra Fast批处理: {len(rgb_batch)} 帧")
+                        
+                        # 处理批处理
+                        self.process_batch_optimized(rgb_batch, ir_batch, original_frames)
+                        
+                        # 记录批处理统计
+                        batch_duration = time.time() - batch_start_time
+                        batch_count += 1
+                        total_batch_time += batch_duration
+                        display_update_counter += 1
+                        
+                        last_batch_process_time = current_time
+                        
+                    except Exception as e:
+                        if not BATCH_CONFIG.get("silent_errors", False):
+                            print(f"批处理异常: {e}")
+                    
+                    # 清空批处理缓冲区
+                    rgb_batch.clear()
+                    ir_batch.clear()
+                    original_frames.clear()
+                
+                # 错误恢复机制
+                if not process_frame:
+                    consecutive_errors += 1
+                    if consecutive_errors >= max_consecutive_errors:
+                        if not enable_fast_mode:
+                            print(f"连续{consecutive_errors}次处理失败，尝试快速恢复...")
+                        if self.quick_recovery():
+                            consecutive_errors = 0
+                
+                # 性能统计 - 在快速模式下减少频率
+                stats_interval = 2.0 if enable_fast_mode else 1.0
+                if current_time - last_fps_time >= stats_interval:
+                    time_delta = current_time - last_fps_time
+                    actual_rgb_fps = rgb_fps_counter / time_delta
+                    actual_ir_fps = ir_fps_counter / time_delta
+                    processed_fps = self.stats['frame_count'] / (current_time - self.stats['start_time'])
+                    
+                    avg_batch_time = total_batch_time / batch_count if batch_count > 0 else 0
+                    avg_batch_fps = batch_size / avg_batch_time if avg_batch_time > 0 else 0
+                    
+                    print(f"📊 Ultra Fast统计: RGB={actual_rgb_fps:.1f}fps, IR={actual_ir_fps:.1f}fps, 处理={processed_fps:.1f}fps")
+                    print(f"🚀 批处理性能: 大小={batch_size}, 缓存={len(rgb_batch)}, 用时={avg_batch_time:.3f}s, 批处理FPS={avg_batch_fps:.1f}")
+                    
+                    # 存储帧率信息
+                    self.rgb_fps = actual_rgb_fps
+                    self.ir_fps = actual_ir_fps
+                    self.processed_fps = processed_fps
+                    
+                    rgb_fps_counter = 0
+                    ir_fps_counter = 0
+                    last_fps_time = current_time
+                
+                # 进一步减少延迟，提升帧率
+                time.sleep(0.0001)
+            
+            except Exception as e:
+                if not BATCH_CONFIG.get("silent_errors", False):
+                    print(f"检测循环异常: {e}")
+                consecutive_errors += 1
+                time.sleep(0.001)
+        
+        # 处理剩余批处理
+        if rgb_batch:
+            print(f"🔄 处理剩余批处理: {len(rgb_batch)} 帧")
+            self.process_batch_optimized(rgb_batch, ir_batch, original_frames)
+    
+    def force_disable_hevc_decoder(self):
+        """简化的HEVC禁用 - 只保留最基本的设置"""
+        try:
+            print("🔧 简化HEVC禁用设置...")
+            
+            # 只设置最基本的环境变量
+            os.environ['OPENCV_FFMPEG_DISABLE_HEVC'] = '1'
+            os.environ['OPENCV_FFMPEG_FORCE_H264'] = '1'
+            
+            # 不再强制重新配置已连接的流，避免引起错误
+            print("✅ 基本HEVC禁用设置完成")
+            
+        except Exception as e:
+            print(f"❌ HEVC禁用设置失败: {e}")
+    
+    def optimize_for_48gb_gpu(self):
+        """专门针对48GB显卡的优化配置"""
+        try:
+            import torch
+            if torch.cuda.is_available():
+                print("🚀 启用48GB显卡专用优化...")
+                
+                # 设置CUDA优化
+                torch.backends.cudnn.benchmark = True
+                torch.backends.cudnn.enabled = True
+                torch.backends.cudnn.deterministic = False
+                torch.backends.cudnn.allow_tf32 = True
+                
+                # 最大化GPU内存使用
+                torch.cuda.set_per_process_memory_fraction(0.98)  # 使用98%的GPU内存
+                
+                # 设置多流处理
+                torch.cuda.set_sync_debug_mode(0)
+                
+                # 预热GPU（原生分辨率）
+                for i in range(3):
+                    dummy = torch.randn(16, 3, 1080, 1920, device='cuda', dtype=torch.float16)  # 1080p原生分辨率
+                    del dummy
+                    torch.cuda.empty_cache()
+                
+                print("✅ 48GB显卡优化配置完成")
+                return True
+        except Exception as e:
+            print(f"❌ 48GB显卡优化失败: {e}")
+            return False
+    
+    # quick_frame_validation函数已删除（未使用）
+    
+    def quick_recovery(self):
+        """快速恢复机制"""
+        try:
+            print("🔄 执行快速恢复...")
+            
+            # 清空解码器缓冲区
+            if self.rgb_cap and self.rgb_cap.isOpened():
+                for _ in range(3):  # 快速读取3帧
+                    self.rgb_cap.read()
+            
+            if self.ir_cap and self.ir_cap.isOpened():
+                for _ in range(3):  # 快速读取3帧
+                    self.ir_cap.read()
+            
+            # 重新强制禁用HEVC
+            self.force_disable_hevc_decoder()
+            
+            print("✅ 快速恢复完成")
+            return True
+            
+        except Exception as e:
+            print(f"❌ 快速恢复失败: {e}")
+            return False
+    
+    def process_batch_optimized(self, rgb_batch, ir_batch, original_frames):
+        """优化的批处理推理 - 简化版本，减少开销"""
+        try:
+            # 获取雷达数据
+            radar_alerts = []
+            if self.radar_enabled and self.radar_processor:
+                radar_data = self.radar_processor.get_latest_data()
+                if radar_data:
+                    self.last_radar_data = radar_data
+                    for target in radar_data['targets']:
+                        if target['超速']:
+                            radar_alert = {
+                                'class_name': 'speed_violation',
+                                'confidence': 1.0,
+                                'radar_data': target,
+                                'description': f"目标{target['目标编号']}超速: {target['速度(m/s)']:.2f}m/s"
+                            }
+                            radar_alerts.append(radar_alert)
+            
+            # 强制使用批处理推理
+            if rgb_batch and ir_batch and len(rgb_batch) == len(ir_batch):
+                all_detections_batch = []
+                batch_size = len(rgb_batch)
+                
+                # 直接进行批处理推理，减少日志输出
+                try:
+                    # 确保预测器有批处理方法
+                    if hasattr(self.predictor, 'predict_batch'):
+                        batch_results = self.predictor.predict_batch(
+                            rgb_batch, ir_batch,
+                            conf_threshold=self.confidence_var.get(),
+                            iou_threshold=0.45
+                        )
+                        
+                        # 快速处理批处理结果
+                        for i, (results, original_rgb, original_ir) in enumerate(zip(batch_results, rgb_batch, ir_batch)):
+                            detections = []
+                            
+                            # 处理检测结果
+                            if results and results.boxes is not None:
+                                boxes = results.boxes.cpu().numpy()
+                                
+                                for box in boxes:
+                                    x1, y1, x2, y2 = box.xyxy[0]
+                                    
+                                    # 确保坐标在图像范围内
+                                    original_h, original_w = original_rgb.shape[:2]
+                                    x1_final = max(0, min(original_w, int(x1)))
+                                    y1_final = max(0, min(original_h, int(y1)))
+                                    x2_final = max(0, min(original_w, int(x2)))
+                                    y2_final = max(0, min(original_h, int(y2)))
+                                    
+                                    detection = {
+                                        'class_name': results.names[int(box.cls[0])],
+                                        'confidence': float(box.conf[0]),
+                                        'bbox': [x1_final, y1_final, x2_final, y2_final]
+                                    }
+                                    detections.append(detection)
+                                
+                                self.stats['detection_count'] += len(detections)
+                            
+                            # 合并雷达预警
+                            frame_detections = detections + radar_alerts
+                            all_detections_batch.append((frame_detections, original_rgb, original_ir))
+                        
+                    else:
+                        # 快速单帧处理
+                        for i, (rgb_frame, ir_frame) in enumerate(zip(rgb_batch, ir_batch)):
+                            detections = []
+                            try:
+                                results = self.predictor.predict_frame(
+                                    rgb_frame, ir_frame,
+                                    conf_threshold=self.confidence_var.get(),
+                                    iou_threshold=0.45
+                                )
+                                
+                                if results and results.boxes is not None:
+                                    boxes = results.boxes.cpu().numpy()
+                                    
+                                    for box in boxes:
+                                        x1, y1, x2, y2 = box.xyxy[0]
+                                        
+                                        original_h, original_w = rgb_frame.shape[:2]
+                                        x1_final = max(0, min(original_w, int(x1)))
+                                        y1_final = max(0, min(original_h, int(y1)))
+                                        x2_final = max(0, min(original_w, int(x2)))
+                                        y2_final = max(0, min(original_h, int(y2)))
+                                        
+                                        detection = {
+                                            'class_name': results.names[int(box.cls[0])],
+                                            'confidence': float(box.conf[0]),
+                                            'bbox': [x1_final, y1_final, x2_final, y2_final]
+                                        }
+                                        detections.append(detection)
+                                    
+                                    self.stats['detection_count'] += len(detections)
+                                    
+                            except Exception as e:
+                                pass  # 静默处理单帧异常
+                            
+                            # 合并雷达预警
+                            frame_detections = detections + radar_alerts
+                            all_detections_batch.append((frame_detections, rgb_frame, ir_frame))
+                
+                except Exception as e:
+                    print(f"❌ 批处理推理失败: {e}")
+                    return
+                
+                # 快速处理结果 - 只发送第一个有检测的帧的预警
+                alert_sent = False
+                for detections, original_rgb, original_ir in all_detections_batch:
+                    if detections and not alert_sent:
+                        try:
+                            success = self.send_kafka_alert(detections, original_rgb, original_ir)
+                            if success:
+                                alert_sent = True
+                        except Exception as e:
+                            pass  # 静默处理Kafka异常
+                
+                # 只更新最后一帧的显示
+                if all_detections_batch:
+                    last_detections, last_rgb, last_ir = all_detections_batch[-1]
+                    self.root.after(0, self.update_display_with_detections, last_rgb, last_ir, last_detections)
+                
+                # 雷达预警统计
+                if radar_alerts:
+                    self.stats['radar_alert_count'] += len(radar_alerts)
+                
+        except Exception as e:
+            print(f"批处理异常: {e}")
+    
+    # update_display_fast函数已删除（未使用）
+    
+    
+    def attempt_reconnect(self):
+        """尝试重新连接RTSP流"""
+        try:
+            print("正在尝试重新连接RTSP流...")
+            
+            # 释放现有连接
+            if self.rgb_cap:
+                self.rgb_cap.release()
+            if self.ir_cap:
+                self.ir_cap.release()
+            
+            # 短暂等待
+            time.sleep(3)
+            
+            # 重新创建连接
+            rgb_source = self.rgb_source_var.get()
+            ir_source = self.ir_source_var.get()
+            
+            # 应用传输协议设置
+            rgb_source = self.build_rtsp_url_with_transport(rgb_source)
+            ir_source = self.build_rtsp_url_with_transport(ir_source)
+            
+            # 尝试转换为整数（摄像头ID）
+            try:
+                rgb_source = int(rgb_source)
+            except ValueError:
+                pass
+            
+            try:
+                ir_source = int(ir_source)
+            except ValueError:
+                pass
+            
+            print(f"重连RGB源: {rgb_source}")
+            print(f"重连IR源: {ir_source}")
+            
+            # 创建新的RTSCapture对象
+            print("🚀 重连时创建RTSCapture对象...")
+            self.rgb_cap = RTSCapture.create(rgb_source)
+            self.ir_cap = RTSCapture.create(ir_source)
+            
+            # 重连时应用相同的优化策略
+            if isinstance(rgb_source, str) and rgb_source.startswith('rtsp://'):
+                # 设置后端
+                self.rgb_cap.set(cv2.CAP_PROP_BACKEND, cv2.CAP_FFMPEG)
+                
+                # GPU硬件加速解码设置
+                if self.device != "cpu":
+                    try:
+                        # 尝试NVIDIA GPU硬件解码
+                        self.rgb_cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('H', '2', '6', '4'))
+                        # 启用硬件加速
+                        self.rgb_cap.set(cv2.CAP_PROP_HW_ACCELERATION, cv2.VIDEO_ACCELERATION_ANY)
+                        self.rgb_cap.set(cv2.CAP_PROP_HW_DEVICE, 0)
+                        print("✅ RGB流重连时启用GPU硬件加速")
+                    except:
+                        # 回退到CPU解码
+                        self.rgb_cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('H', '2', '6', '4'))
+                        print("⚠️ RGB流重连时回退到CPU解码")
+                else:
+                    self.rgb_cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('H', '2', '6', '4'))
+                
+                # 网络缓冲机制 - 100ms缓冲
+                try:
+                    fps = 25
+                    buffer_ms = self.buffer_time_var.get()
+                    buffer_frames = max(2, int(fps * (buffer_ms / 1000.0)))
+                    self.rgb_cap.set(cv2.CAP_PROP_BUFFERSIZE, buffer_frames)
+                    print(f"✅ RGB重连时网络缓冲设置为{buffer_frames}帧({buffer_ms}ms@{fps}fps)")
+                except:
+                    pass
+                
+                # 重连时设置参数
+                try:
+                    self.rgb_cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+                    self.rgb_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+                    self.rgb_cap.set(cv2.CAP_PROP_FPS, 25)
+                    
+                    self.rgb_cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 15000)
+                    self.rgb_cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 8000)
+                    self.rgb_cap.set(cv2.CAP_PROP_FORMAT, cv2.CAP_PROP_FORMAT_AUTO)
+                    print("✅ RGB流重连参数设置完成")
+                except:
+                    pass
+                
+            if isinstance(ir_source, str) and ir_source.startswith('rtsp://'):
+                # 设置后端
+                self.ir_cap.set(cv2.CAP_PROP_BACKEND, cv2.CAP_FFMPEG)
+                
+                # GPU硬件加速解码设置
+                if self.device != "cpu":
+                    try:
+                        # 尝试NVIDIA GPU硬件解码
+                        self.ir_cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('H', '2', '6', '4'))
+                        # 启用硬件加速
+                        self.ir_cap.set(cv2.CAP_PROP_HW_ACCELERATION, cv2.VIDEO_ACCELERATION_ANY)
+                        self.ir_cap.set(cv2.CAP_PROP_HW_DEVICE, 0)
+                        print("✅ IR流重连时启用GPU硬件加速")
+                    except:
+                        # 回退到CPU解码
+                        self.ir_cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('H', '2', '6', '4'))
+                        print("⚠️ IR流重连时回退到CPU解码")
+                else:
+                    self.ir_cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('H', '2', '6', '4'))
+                
+                # 网络缓冲机制 - 100ms缓冲
+                try:
+                    fps = 25
+                    buffer_ms = self.buffer_time_var.get()
+                    buffer_frames = max(2, int(fps * (buffer_ms / 1000.0)))
+                    self.ir_cap.set(cv2.CAP_PROP_BUFFERSIZE, buffer_frames)
+                    print(f"✅ IR重连时网络缓冲设置为{buffer_frames}帧({buffer_ms}ms@{fps}fps)")
+                except:
+                    pass
+                
+                # 重连时设置参数
+                try:
+                    self.ir_cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+                    self.ir_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+                    self.ir_cap.set(cv2.CAP_PROP_FPS, 25)
+                    
+                    self.ir_cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 15000)
+                    self.ir_cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 8000)
+                    self.ir_cap.set(cv2.CAP_PROP_FORMAT, cv2.CAP_PROP_FORMAT_AUTO)
+                    print("✅ IR流重连参数设置完成")
+                except:
+                    pass
+            
+            # 启动RTSCapture读取
+            if self.rgb_cap.isOpened() and self.ir_cap.isOpened():
+                print("🚀 重连时启动RTSCapture读取...")
+                self.rgb_cap.start_read()
+                self.ir_cap.start_read()
+                
+                # 等待后台线程启动
+                time.sleep(1)
+                
+                # 测试读取多帧，确保稳定
+                rgb_success = False
+                ir_success = False
+                
+                for attempt in range(10):  # 尝试10次
+                    try:
+                        ret_rgb, rgb_frame = self.rgb_cap.read_latest_frame()
+                        if ret_rgb and rgb_frame is not None and rgb_frame.size > 0:
+                            rgb_success = True
+                            break
+                    except:
+                        continue
+                    time.sleep(0.1)  # 等待新帧
+                
+                for attempt in range(10):  # 尝试10次
+                    try:
+                        ret_ir, ir_frame = self.ir_cap.read_latest_frame()
+                        if ret_ir and ir_frame is not None and ir_frame.size > 0:
+                            ir_success = True
+                            break
+                    except:
+                        continue
+                    time.sleep(0.1)  # 等待新帧
+                
+                if rgb_success and ir_success:
+                    self.connection_status_var.set("重连成功")
+                    self.connection_status_label.configure(foreground="green")
+                    self.status_var.set("检测中...")
+                    print("RTSP流重连成功，已优化HEVC处理")
+                    return True
+                else:
+                    print(f"重连失败: RGB={rgb_success}, IR={ir_success}")
+            
+            return False
+            
+        except Exception as e:
+            print(f"重连异常: {e}")
+            return False
+    
+
+    
+    def update_stats(self):
+        """更新统计信息"""
+        runtime = time.time() - self.stats['start_time']
+        
+        # 获取独立的帧率信息 (包含RTSCapture实时FPS)
+        rgb_fps = getattr(self, 'rgb_fps', 0)
+        ir_fps = getattr(self, 'ir_fps', 0)
+        processed_fps = getattr(self, 'processed_fps', 0)
+        
+        # 获取RTSCapture的实时FPS
+        rgb_rtscap_fps = 0
+        ir_rtscap_fps = 0
+        if hasattr(self, 'rgb_cap') and self.rgb_cap:
+            rgb_rtscap_fps = self.rgb_cap.get_fps()
+        if hasattr(self, 'ir_cap') and self.ir_cap:
+            ir_rtscap_fps = self.ir_cap.get_fps()
+        
+        # 计算GPU利用率（如果可用）
+        gpu_info = ""
+        try:
+            if self.predictor and hasattr(self.predictor, 'get_gpu_memory_info'):
+                gpu_mem_info = self.predictor.get_gpu_memory_info()
+                if gpu_mem_info['total'] > 0:
+                    gpu_info = f"GPU内存: {gpu_mem_info['allocated']:.1f}GB / {gpu_mem_info['total']:.1f}GB ({gpu_mem_info['utilization']:.1f}%)\n"
+                    gpu_info += f"GPU缓存: {gpu_mem_info['cached']:.1f}GB\n"
+                    
+                    # 48GB显卡内存使用评估
+                    if gpu_mem_info['allocated'] < 10.0:
+                        gpu_info += "⚠️ GPU内存使用率较低，可能未充分利用48GB显卡\n"
+                    elif gpu_mem_info['allocated'] >= 20.0:
+                        gpu_info += "✅ GPU内存使用充分，48GB显卡高效运行\n"
+                    else:
+                        gpu_info += "🔧 GPU内存使用中等，48GB显卡有进一步优化空间\n"
+            else:
+                import torch
+                if torch.cuda.is_available():
+                    gpu_memory = torch.cuda.memory_allocated() / (1024**3)  # GB
+                    gpu_max_memory = torch.cuda.max_memory_allocated() / (1024**3)  # GB
+                    gpu_total = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+                    gpu_utilization = (gpu_memory / gpu_total * 100) if gpu_total > 0 else 0
+                    gpu_info = f"GPU内存: {gpu_memory:.1f}GB / {gpu_total:.1f}GB ({gpu_utilization:.1f}%)\n"
+        except Exception as e:
+            gpu_info = f"GPU信息获取失败: {e}\n"
+        
+        # 独立处理状态 - 不进行双模态对齐
+        alignment_status = ""
+        fps_diff = 0
+        if rgb_fps > 0 and ir_fps > 0:
+            fps_diff = abs(rgb_fps - ir_fps)
+            alignment_status = f"🚀 独立处理 (RGB:{rgb_fps:.1f}, IR:{ir_fps:.1f}fps)"
+            self.alignment_status_var.set(f"独立处理 ({fps_diff:.1f}fps差值)")
+            self.alignment_status_label.configure(foreground="blue")
+        elif rgb_fps > 0 or ir_fps > 0:
+            alignment_status = "🚀 单通道独立处理"
+            self.alignment_status_var.set("单通道独立")
+            self.alignment_status_label.configure(foreground="blue")
+        else:
+            alignment_status = "⏳ 帧率检测中..."
+            self.alignment_status_var.set("检测中...")
+            self.alignment_status_label.configure(foreground="gray")
+        
+        # 性能评估 - 独立处理模式评估
+        performance_tips = ""
+        if processed_fps < 25:
+            performance_tips += "🔧 性能优化建议:\n"
+            if processed_fps < 20:
+                performance_tips += "• 检查网络连接稳定性\n• 考虑降低分辨率\n"
+            performance_tips += "• 独立处理模式已启用\n• 48GB显卡算力充足\n"
+        elif processed_fps >= 25:
+            performance_tips += "✅ 独立处理性能优秀\n"
+        
+        # 连接状态
+        connection_info = ""
+        if rgb_fps > 0 and ir_fps > 0:
+            connection_info = "🔗 双流连接正常\n"
+        elif rgb_fps > 0 or ir_fps > 0:
+            connection_info = "⚠️ 单流连接\n"
+        else:
+            connection_info = "❌ 流连接异常\n"
+        
+        # 视频解码状态 - 简化版本
+        decode_info = ""
+        total_errors = getattr(self, 'hevc_error_count', 0)
+        
+        if total_errors > 0:
+            decode_info = f"解码错误: {total_errors} (已禁用HEVC)\n"
+            self.decode_status_var.set(f"H.264解码 ({total_errors})")
+            self.decode_status_label.configure(foreground="orange")
+        else:
+            # 无错误状态
+            decode_info = "H.264解码，HEVC已禁用\n"
+            self.decode_status_var.set("H.264解码")
+            self.decode_status_label.configure(foreground="green")
+        
+        # 摄像头AI状态
+        camera_ai_info = ""
+        if hasattr(self, 'camera_ai_disabled') and self.camera_ai_disabled:
+            camera_ai_info = "摄像头AI: 已关闭 (避免冲突)\n"
+        elif hasattr(self, 'camera_ai_enabled_var') and self.camera_ai_enabled_var.get():
+            camera_ai_info = "摄像头AI: 已启用\n"
+        else:
+            camera_ai_info = "摄像头AI: 未设置\n"
+        
+        stats_info = f"""运行时间: {runtime:.1f}s
+{connection_info}RGB帧率: {rgb_fps:.1f}fps (RTSCapture: {rgb_rtscap_fps:.1f}fps)
+IR帧率: {ir_fps:.1f}fps (RTSCapture: {ir_rtscap_fps:.1f}fps)
+处理帧率: {processed_fps:.1f}fps (模型推理)
+{alignment_status}
+
+处理帧数: {self.stats['frame_count']}
+检测总数: {self.stats['detection_count']}
+预警总数: {self.stats['alert_count']}
+雷达预警: {self.stats['radar_alert_count']}
+Kafka成功: {self.stats['kafka_sent']}
+Kafka失败: {self.stats['kafka_failed']}
+{decode_info}{camera_ai_info}{gpu_info}{performance_tips}"""
+        
+        self.stats_text.delete(1.0, tk.END)
+        self.stats_text.insert(1.0, stats_info)
+    
+    def update_results(self, detections):
+        """更新检测结果"""
+        if not detections:
+            results_info = "无检测结果"
+        else:
+            results_info = f"检测到 {len(detections)} 个对象:\n\n"
+            for i, detection in enumerate(detections, 1):
+                class_name = detection['class_name']
+                confidence = detection['confidence']
+                results_info += f"{i}. {class_name} ({confidence:.3f})\n"
+                
+                # 检查是否需要预警
+                if class_name in ['climb', 'tailgating', 'carrybaby', 'speed_violation']:
+                    results_info += f"   ⚠️ 预警: {self.get_alert_description(class_name)}\n"
+                    if class_name == 'speed_violation':
+                        if 'radar_data' in detection:
+                            radar_data = detection['radar_data']
+                            results_info += f"   雷达数据: 速度{radar_data['速度(m/s)']:.2f}m/s\n"
+                    self.stats['alert_count'] += 1
+        
+        self.results_text.delete(1.0, tk.END)
+        self.results_text.insert(1.0, results_info)
+    
+    def update_radar_display(self):
+        """更新雷达数据显示"""
+        if not self.radar_enabled or not self.last_radar_data:
+            radar_info = "雷达未启用或无数据"
+        else:
+            radar_data = self.last_radar_data
+            timestamp = datetime.fromtimestamp(radar_data['timestamp']).strftime('%H:%M:%S')
+            targets = radar_data['targets']
+            
+            radar_info = f"更新时间: {timestamp}\n"
+            radar_info += f"目标数量: {len(targets)}\n"
+            radar_info += f"速度阈值: {SPEED_THRESHOLD:.1f}m/s\n\n"
+            
+            if targets:
+                radar_info += "目标详情:\n"
+                for i, target in enumerate(targets, 1):
+                    status = "⚠️超速" if target['超速'] else "正常"
+                    radar_info += f"{i}. ID:{target['目标编号']} "
+                    radar_info += f"速度:{target['速度(m/s)']:.2f}m/s "
+                    radar_info += f"距离:{target['距离(m)']:.2f}m "
+                    radar_info += f"[{status}]\n"
+                    
+                    if i >= 8:  # 限制显示数量
+                        radar_info += f"... 还有{len(targets)-8}个目标\n"
+                        break
+            else:
+                radar_info += "无目标检测"
+        
+        self.radar_text.delete(1.0, tk.END)
+        self.radar_text.insert(1.0, radar_info)
+    
+    def save_screenshot(self):
+        """保存截图"""
+        if not self.is_running:
+            return
+        
+        try:
+            ret_rgb, rgb_frame = self.rgb_cap.read_latest_frame()
+            if ret_rgb and rgb_frame is not None:
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                filename = f"screenshot_{timestamp}.jpg"
+                cv2.imwrite(filename, rgb_frame)
+                messagebox.showinfo("成功", f"截图已保存: {filename}\n使用RTSCapture最新帧")
+            else:
+                messagebox.showwarning("警告", "无法获取当前帧，请确保视频流正常")
+        except Exception as e:
+            messagebox.showerror("错误", f"保存截图失败: {e}")
+    
+    
+    
+    # validate_frame_quality函数已删除（未使用）
+    
+
+
+    
+    def update_display_with_detections(self, rgb_frame, ir_frame, detections):
+        """更新显示（带检测框）"""
+        try:
+            # 绘制检测框
+            rgb_display = rgb_frame.copy()
+            
+            for detection in detections:
+                if 'bbox' in detection:
+                    bbox = detection['bbox']
+                    class_name = detection['class_name']
+                    confidence = detection['confidence']
+                    
+                    x1, y1, x2, y2 = map(int, bbox)
+                    color = (0, 255, 0) if class_name == 'normal' else (0, 0, 255)
+                    
+                    cv2.rectangle(rgb_display, (x1, y1), (x2, y2), color, 2)
+                    label = f"{class_name}: {confidence:.2f}"
+                    cv2.putText(rgb_display, label, (x1, y1-10), 
+                              cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+            
+            # 显示雷达预警
+            if any(d['class_name'] == 'speed_violation' for d in detections):
+                radar_alerts = [d for d in detections if d['class_name'] == 'speed_violation']
+                y_offset = 30
+                for alert in radar_alerts:
+                    alert_text = f"⚠️ 雷达预警: {alert['description']}"
+                    cv2.putText(rgb_display, alert_text, (10, y_offset), 
+                              cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                    y_offset += 25
+            
+            # 调用原有的显示更新方法
+            self.update_display(rgb_display, ir_frame, detections)
+            
+        except Exception as e:
+            print(f"检测显示更新错误: {e}")
+    
+
+    def update_display(self, rgb_frame, ir_frame, detections):
+        """更新显示"""
+        try:
+            # 动态计算显示尺寸，而不是硬编码350x250
+            # 获取显示区域的实际尺寸
+            try:
+                # 尝试获取label的实际尺寸
+                label_width = self.rgb_label.winfo_width()
+                label_height = self.rgb_label.winfo_height()
+                
+                # 如果label还没有被渲染，使用默认尺寸
+                if label_width <= 1 or label_height <= 1:
+                    display_width, display_height = 350, 250
+                else:
+                    # 留出一些边距
+                    display_width = max(200, min(600, label_width - 20))
+                    display_height = max(150, min(450, label_height - 20))
+            except:
+                # 回退到默认尺寸
+                display_width, display_height = 350, 250
+            
+            # 调整图像尺寸
+            rgb_frame = cv2.resize(rgb_frame, (display_width, display_height))
+            ir_frame = cv2.resize(ir_frame, (display_width, display_height))
+            
+            # 转换为RGB格式
+            rgb_frame = cv2.cvtColor(rgb_frame, cv2.COLOR_BGR2RGB)
+            ir_frame = cv2.cvtColor(ir_frame, cv2.COLOR_BGR2RGB)
+            
+            # 转换为PIL Image
+            rgb_image = Image.fromarray(rgb_frame)
+            ir_image = Image.fromarray(ir_frame)
+            
+            # 转换为PhotoImage
+            rgb_photo = ImageTk.PhotoImage(rgb_image)
+            ir_photo = ImageTk.PhotoImage(ir_image)
+            
+            # 更新显示
+            self.rgb_label.configure(image=rgb_photo)
+            self.rgb_label.image = rgb_photo
+            
+            self.ir_label.configure(image=ir_photo)
+            self.ir_label.image = ir_photo
+            
+            # 更新统计信息
+            self.update_stats()
+            
+            # 更新检测结果
+            self.update_results(detections)
+            
+            # 更新雷达信息
+            self.update_radar_display()
+            
+        except Exception as e:
+            print(f"更新显示错误: {e}")
+    
+
+    
+    
+    
+    def simple_buffer_clear(self, stream_type):
+        """简单的缓冲区清空，专门处理POC错误"""
+        try:
+            cap = self.rgb_cap if stream_type == "RGB" else self.ir_cap
+            if cap and cap.isOpened():
+                # 快速读取几帧清空缓冲区，跳过损坏的帧
+                for _ in range(5):
+                    try:
+                        ret, frame = cap.read()
+                        if not ret:
+                            break
+                        # 如果读取成功，检查是否是有效帧
+                        if frame is not None and frame.size > 0:
+                            # 简单检查帧是否正常
+                            if frame.shape[0] > 10 and frame.shape[1] > 10:
+                                print(f"✅ {stream_type}获得有效帧，POC错误已跳过")
+                                break
+                    except:
+                        continue
+                print(f"✅ {stream_type}缓冲区已清空")
+        except Exception as e:
+            print(f"⚠️ {stream_type}缓冲区清空失败: {e}")
+    
+
+    
+
+    
+
+    
+    def build_rtsp_url_with_transport(self, base_url):
+        """
+        根据用户选择的传输协议构建RTSP URL
+        注意：TCP传输已经通过环境变量 os.environ['OPENCV_FFMPEG_CAPTURE_OPTIONS'] = 'rtsp_transport;tcp' 全局设置。
+        此处不再需要修改URL，否则可能导致某些摄像头无法识别带参数的URL。
+        """
+        return base_url
+        
+        # transport_option = self.rtsp_transport_var.get()
+        
+        # if transport_option == "TCP (推荐)":
+        #     # 强制使用TCP传输，并添加HEVC解码优化参数
+        #     if '?' not in base_url:
+        #         return base_url + '?tcp&profile=baseline'
+        #     else:
+        #         url = base_url + '&tcp' if 'tcp' not in base_url else base_url
+        #         if 'profile' not in url:
+        #             url += '&profile=baseline'
+        #         return url
+        # elif transport_option == "UDP":
+        #     # 强制使用UDP传输，并添加HEVC解码优化参数
+        #     if '?' not in base_url:
+        #         return base_url + '?udp&profile=baseline'
+        #     else:
+        #         url = base_url + '&udp' if 'udp' not in base_url else base_url
+        #         if 'profile' not in url:
+        #             url += '&profile=baseline'
+        #         return url
+        # else:
+        #     # 自动选择，但仍然添加优化参数
+        #     if '?' not in base_url:
+        #         return base_url + '?profile=baseline'
+        #     else:
+        #         return base_url + '&profile=baseline' if 'profile' not in base_url else base_url
+
+
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = DualModalDetectionGUI(root)
+    root.mainloop()
