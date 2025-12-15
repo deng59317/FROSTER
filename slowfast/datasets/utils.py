@@ -77,6 +77,34 @@ def get_sequence(center_idx, half_len, sample_rate, num_frames):
     return seq
 
 
+def list_videos_by_order(root_dir, allowed_exts=(
+    ".mp4",
+    ".avi",
+    ".webm",
+    ".mov",
+    ".mkv",
+    ".flv",
+)):
+    """Return a deterministically sorted list of video paths under ``root_dir``.
+
+    Args:
+        root_dir (str): Root directory containing video files.
+        allowed_exts (tuple): Extensions (lowercased) treated as valid videos.
+
+    Returns:
+        list[str]: Relative paths from ``root_dir`` sorted by directory then name.
+    """
+
+    video_paths = []
+    for cur_root, dirnames, filenames in os.walk(root_dir):
+        dirnames.sort()
+        for fname in sorted(filenames):
+            if fname.lower().endswith(allowed_exts):
+                full_path = os.path.join(cur_root, fname)
+                video_paths.append(os.path.relpath(full_path, root_dir))
+    return video_paths
+
+
 def pack_pathway_output(cfg, frames):
     """
     Prepare output as a list of tensors. Each tensor corresponding to a
@@ -88,6 +116,18 @@ def pack_pathway_output(cfg, frames):
         frame_list (list): list of tensors with the dimension of
             `channel` x `num frames` x `height` x `width`.
     """
+    if cfg.DATA.MODALITY == "rgb_ir" and isinstance(frames, (list, tuple)):
+        frame_list = []
+        for pathway in frames:
+            cur_frames = pathway
+            if (
+                cfg.DATA.REVERSE_INPUT_CHANNEL
+                and cur_frames.shape[0] >= 3
+            ):
+                cur_frames = cur_frames[[2, 1, 0], :, :, :]
+            frame_list.append(cur_frames)
+        return frame_list
+        
     if cfg.DATA.REVERSE_INPUT_CHANNEL:
         frames = frames[[2, 1, 0], :, :, :]
     if cfg.MODEL.ARCH in cfg.MODEL.SINGLE_PATHWAY_ARCH:
