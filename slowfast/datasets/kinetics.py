@@ -7,6 +7,8 @@ import random
 import pandas
 import torch
 import torch.utils.data
+import torch.nn.functional as F
+from collections import OrderedDict
 from torchvision import transforms
 
 import slowfast.utils.logging as logging
@@ -80,6 +82,13 @@ class Kinetics(torch.utils.data.Dataset):
             else False
         )
         self.dummy_output = None
+
+        # dual-modal 开关：rgb_ir 模式
+        self.dual_modal = self.cfg.DATA.MODALITY == "rgb_ir"
+        if self.dual_modal:
+            self._path_to_videos_ir = []
+            self._video_meta_ir = {}
+
         # For training or validation mode, one single clip is sampled from every
         # video. For testing, NUM_ENSEMBLE_VIEWS clips are sampled from every
         # video. For every clip, NUM_SPATIAL_CROPS is cropped spatially from
@@ -93,6 +102,9 @@ class Kinetics(torch.utils.data.Dataset):
 
         logger.info("Constructing Kinetics {}...".format(mode))
         self._construct_loader()
+        if self.dual_modal and self.cfg.DATA.VERIFY_DUAL_MODAL_PAIRS:
+            self._verify_dual_modal_pairs()
+
         self.aug = False
         self.rand_erase = False
         self.use_temporal_gradient = False
@@ -109,23 +121,44 @@ class Kinetics(torch.utils.data.Dataset):
         Construct the video loader.
         """
         if self.mode == "train":
-            path_to_file = self.cfg.TRAIN_FILE
+            split_file = self.cfg.TRAIN_FILE
+            split_file_ir = self.cfg.TRAIN_FILE_IR
         elif self.mode == "val":
-            path_to_file = self.cfg.VAL_FILE
+            split_file = self.cfg.VAL_FILE
+            split_file_ir = self.cfg.VAL_FILE_IR
         elif self.mode == "test":
-            path_to_file = self.cfg.TEST_FILE
+            split_file = self.cfg.TEST_FILE
+            split_file_ir = self.cfg.TEST_FILE_IR
         else:
-            raise RuntimeError("Unknown split mode {}".format(self.mode))  
+            raise RuntimeError("Unknown split mode {}".format(self.mode))
+
         path_to_file = os.path.join(
-            self.cfg.DATA.PATH_TO_DATA_DIR, "{}".format(path_to_file)
+            self.cfg.DATA.PATH_TO_DATA_DIR, "{}".format(split_file)
         )
-        # path_to_file = os.path.join(
-        #     self.cfg.DATA.PATH_TO_DATA_DIR, "{}.csv".format(self.mode)
-        # )
-        
+
+        # IR 注释文件逻辑：如果显式给了 IR data dir 或者 IR split 文件不同，则尝试加载
+        split_file_ir = split_file_ir if split_file_ir else split_file
+        ir_annotations_enabled = self.dual_modal and (
+            self.cfg.DATA.PATH_TO_DATA_DIR_IR or split_file_ir != split_file
+        )
+        path_to_file_ir = (
+            os.path.join(
+                self.cfg.DATA.PATH_TO_DATA_DIR_IR
+                if self.cfg.DATA.PATH_TO_DATA_DIR_IR
+                else self.cfg.DATA.PATH_TO_DATA_DIR,
+                "{}".format(split_file_ir),
+            )
+            if ir_annotations_enabled
+            else None
+        )
+
         assert pathmgr.exists(path_to_file), "{} dir not found".format(
             path_to_file
         )
+        if path_to_file_ir:
+            assert pathmgr.exists(path_to_file_ir), "{} dir not found".format(
+                path_to_file_ir
+            )
 
         self._path_to_videos = []
         self._labels = []
@@ -134,36 +167,136 @@ class Kinetics(torch.utils.data.Dataset):
         self.chunk_epoch = 0
         self.epoch = 0.0
         self.skip_rows = self.cfg.DATA.SKIP_ROWS
-        
-        print('path: ----------------------------', path_to_file)
+
         with pathmgr.open(path_to_file, "r") as f:
             if self.use_chunk_loading:
                 rows = self._get_chunk(f, self.cfg.DATA.LOADER_CHUNK_SIZE)
             else:
                 rows = f.read().splitlines()
+
+            rows_ir = None
+            if path_to_file_ir:
+                with pathmgr.open(path_to_file_ir, "r") as f_ir:
+                    rows_ir = f_ir.read().splitlines()
+                if len(rows_ir) != len(rows):
+                    raise RuntimeError(
+                        "RGB annotations ({} entries) and IR annotations ({} entries)"
+                        " must describe the same number of clips when"
+                        " DATA.PATH_TO_DATA_DIR_IR is set.".format(
+                            len(rows), len(rows_ir)
+                        )
+                    )
+
+            # 如果有表头，跳过第一行
+            if len(rows) > 0 and "label" in rows[0]:
+                rows = rows[1:]
+                if rows_ir is not None and len(rows_ir) > 0:
+                    rows_ir = rows_ir[1:]
+
+            # 根据文件夹顺序自动匹配 IR（当 csv 中没写 IR 路径时）
+            ir_order = None
+            if self.dual_modal and self.cfg.DATA.MATCH_DUAL_MODAL_BY_ORDER:
+                ir_order = utils.list_videos_by_order(self.cfg.DATA.PATH_PREFIX_IR)
+                if len(ir_order) < len(rows):
+                    raise RuntimeError(
+                        "Expected at least {} IR clips under {} but found {}."
+                        " Ensure the infrared folder is complete or disable"
+                        " DATA.MATCH_DUAL_MODAL_BY_ORDER.".format(
+                            len(rows), self.cfg.DATA.PATH_PREFIX_IR, len(ir_order)
+                        )
+                    )
+
             for clip_idx, path_label in enumerate(rows):
-                fetch_info = path_label.split(
-                    self.cfg.DATA.PATH_LABEL_SEPARATOR
-                )
+                fetch_info = [
+                    item.strip()
+                    for item in path_label.split(self.cfg.DATA.PATH_LABEL_SEPARATOR)
+                    if item != ""
+                ]
+
+                ir_pair = None
+                if rows_ir is not None:
+                    ir_fetch = [
+                        item.strip()
+                        for item in rows_ir[clip_idx].split(
+                            self.cfg.DATA.PATH_LABEL_SEPARATOR
+                        )
+                        if item != ""
+                    ]
+                    if len(ir_fetch) >= 1:
+                        ir_path_candidate = ir_fetch[0]
+                        ir_label_candidate = (
+                            ir_fetch[-1] if len(ir_fetch) > 1 else None
+                        )
+                        ir_pair = (ir_path_candidate, ir_label_candidate)
+
                 if len(fetch_info) == 2:
                     path, label = fetch_info
+                    path_ir = None
                 elif len(fetch_info) == 3:
-                    path, fn, label = fetch_info
+                    if self.dual_modal:
+                        path, path_ir, label = fetch_info
+                    else:
+                        path, fn, label = fetch_info
+                        path_ir = None
                 elif len(fetch_info) == 1:
                     path, label = fetch_info[0], 0
+                    path_ir = None
                 else:
                     raise RuntimeError(
                         "Failed to parse video fetch {} info {} retries.".format(
                             path_to_file, fetch_info
                         )
                     )
+
+                # 如果 csv 有 IR 注释信息，则优先使用；并检查 label 一致性
+                if self.dual_modal and path_ir is None and ir_pair is not None:
+                    path_ir, ir_label = ir_pair
+                    if ir_label not in [None, "", str(label)]:
+                        raise RuntimeError(
+                            "Mismatched labels between RGB ({}) and IR ({}) annotations"
+                            " for clip {}".format(label, ir_label, clip_idx)
+                        )
+
+                # 如果还没 IR 路径，同时开启了按顺序匹配，则从 IR 目录按顺序配对
+                if (
+                    self.dual_modal
+                    and path_ir is None
+                    and self.cfg.DATA.MATCH_DUAL_MODAL_BY_ORDER
+                ):
+                    path_ir = ir_order[clip_idx]
+
+                # ==== 关键修改 1：清理路径中的引号 ====
+                path = str(path).strip().strip('"').strip("'")
+                if path_ir is not None:
+                    path_ir = str(path_ir).strip().strip('"').strip("'")
+
                 for idx in range(self._num_clips):
-                    self._path_to_videos.append(
-                        os.path.join(self.cfg.DATA.PATH_PREFIX, path)
-                    )
+                    # ==== 关键修改 2：绝对路径不再拼接 PATH_PREFIX ====
+                    if os.path.isabs(path):
+                        rgb_path = path
+                    else:
+                        rgb_path = os.path.join(self.cfg.DATA.PATH_PREFIX, path)
+                    self._path_to_videos.append(rgb_path)
+
+                    if self.dual_modal:
+                        if path_ir is None:
+                            raise RuntimeError(
+                                "Missing infrared path while DATA.MODALITY is rgb_ir"
+                            )
+                        if os.path.isabs(path_ir):
+                            ir_path = path_ir
+                        else:
+                            ir_path = os.path.join(
+                                self.cfg.DATA.PATH_PREFIX_IR, path_ir
+                            )
+                        self._path_to_videos_ir.append(ir_path)
+
                     self._labels.append(int(label))
                     self._spatial_temporal_idx.append(idx)
                     self._video_meta[clip_idx * self._num_clips + idx] = {}
+                    if self.dual_modal:
+                        self._video_meta_ir[clip_idx * self._num_clips + idx] = {}
+
         assert (
             len(self._path_to_videos) > 0
         ), "Failed to load Kinetics split {} from {}".format(
@@ -200,12 +333,9 @@ class Kinetics(torch.utils.data.Dataset):
         Args:
             index (int): the video index provided by the pytorch sampler.
         Returns:
-            frames (tensor): the frames of sampled from the video. The dimension
-                is `channel` x `num frames` x `height` x `width`.
-            label (int): the label of the current video.
-            index (int): if the video provided by pytorch sampler can be
-                decoded, then return the index of the video. If not, return the
-                index of the video replacement that can be decoded.
+            frames (tensor or list): the frames of sampled from the video.
+            label (int or list): the label(s) of the current video.
+            index (int or list): original index(es).
         """
         short_cycle_idx = None
         # When short cycle is used, input index is a tupple.
@@ -262,12 +392,13 @@ class Kinetics(torch.utils.data.Dataset):
                 + [self.cfg.DATA.TEST_CROP_SIZE]
             )
             # The testing is deterministic and no jitter should be performed.
-            # min_scale, max_scale, and crop_size are expect to be the same.
+            # min_scale, max-scale, and crop_size are expect to be the same.
             assert len({min_scale, max_scale}) == 1
         else:
             raise NotImplementedError(
                 "Does not support {} mode".format(self.mode)
             )
+
         num_decode = (
             self.cfg.DATA.TRAIN_CROP_NUM_TEMPORAL
             if self.mode in ["train"]
@@ -289,10 +420,12 @@ class Kinetics(torch.utils.data.Dataset):
                 * (num_decode - len(crop_size))
             )
             assert self.mode in ["train", "val"]
+
         # Try to decode and sample a clip from a video. If the video can not be
         # decoded, repeatly find a random video replacement that can be decoded.
         for i_try in range(self._num_retries):
             video_container = None
+            video_container_ir = None
             try:
                 video_container = container.get_video_container(
                     self._path_to_videos[index],
@@ -320,35 +453,82 @@ class Kinetics(torch.utils.data.Dataset):
                     index = random.randint(0, len(self._path_to_videos) - 1)
                 continue
 
+            if self.dual_modal:
+                try:
+                    video_container_ir = container.get_video_container(
+                        self._path_to_videos_ir[index],
+                        self.cfg.DATA_LOADER.ENABLE_MULTI_THREAD_DECODE,
+                        self.cfg.DATA.DECODING_BACKEND,
+                    )
+                except Exception as e:
+                    logger.info(
+                        "Failed to load infrared video from {} with error {}".format(
+                            self._path_to_videos_ir[index], e
+                        )
+                    )
+                    if self.mode not in ["test", "test_openset"]:
+                        index = random.randint(0, len(self._path_to_videos) - 1)
+                    continue
+                if video_container_ir is None:
+                    logger.warning(
+                        "Failed to meta load infrared video idx {} from {}; trial {}".format(
+                            index, self._path_to_videos_ir[index], i_try
+                        )
+                    )
+                    if self.mode not in ["test", "test_openset"] and i_try > self._num_retries // 8:
+                        index = random.randint(0, len(self._path_to_videos) - 1)
+                    continue
+
             frames_decoded, time_idx_decoded = (
                 [None] * num_decode,
                 [None] * num_decode,
             )
+            frames_ir_decoded = [None] * num_decode if self.dual_modal else None
 
-            # for i in range(num_decode):
-            num_frames = [self.cfg.DATA.NUM_FRAMES]
+            # RGB 帧数
+            rgb_num_frames = [self.cfg.DATA.NUM_FRAMES]
             sampling_rate = utils.get_random_sampling_rate(
                 self.cfg.MULTIGRID.LONG_CYCLE_SAMPLING_RATE,
                 self.cfg.DATA.SAMPLING_RATE,
             )
             sampling_rate = [sampling_rate]
-            if len(num_frames) < num_decode:
-                num_frames.extend(
+            if len(rgb_num_frames) < num_decode:
+                rgb_num_frames.extend(
                     [
-                        num_frames[-1]
-                        for i in range(num_decode - len(num_frames))
+                        rgb_num_frames[-1]
+                        for _ in range(num_decode - len(rgb_num_frames))
                     ]
                 )
                 # base case where keys have same frame-rate as query
                 sampling_rate.extend(
                     [
                         sampling_rate[-1]
-                        for i in range(num_decode - len(sampling_rate))
+                        for _ in range(num_decode - len(sampling_rate))
                     ]
                 )
-            elif len(num_frames) > num_decode:
-                num_frames = num_frames[:num_decode]
+            elif len(rgb_num_frames) > num_decode:
+                rgb_num_frames = rgb_num_frames[:num_decode]
                 sampling_rate = sampling_rate[:num_decode]
+
+            # IR 帧数（可单独配置）
+            if self.dual_modal:
+                ir_num_frames_value = (
+                    self.cfg.DATA.NUM_FRAMES_IR
+                    if self.cfg.DATA.NUM_FRAMES_IR > 0
+                    else self.cfg.DATA.NUM_FRAMES
+                )
+                ir_num_frames = [ir_num_frames_value]
+                if len(ir_num_frames) < num_decode:
+                    ir_num_frames.extend(
+                        [
+                            ir_num_frames[-1]
+                            for _ in range(num_decode - len(ir_num_frames))
+                        ]
+                    )
+                elif len(ir_num_frames) > num_decode:
+                    ir_num_frames = ir_num_frames[:num_decode]
+            else:
+                ir_num_frames = None
 
             if self.mode in ["train"]:
                 assert (
@@ -364,11 +544,11 @@ class Kinetics(torch.utils.data.Dataset):
                     0.0, self.cfg.DATA.TRAIN_JITTER_FPS
                 )
 
-            # Decode video. Meta info is used to perform selective decoding.
+            # Decode RGB video.
             frames, time_idx, tdiff = decoder.decode(
                 video_container,
                 sampling_rate,
-                num_frames,
+                rgb_num_frames,
                 temporal_sample_index,
                 self.cfg.TEST.NUM_ENSEMBLE_VIEWS,
                 video_meta=self._video_meta[index]
@@ -390,6 +570,32 @@ class Kinetics(torch.utils.data.Dataset):
             frames_decoded = frames
             time_idx_decoded = time_idx
 
+            # Decode IR video.
+            if self.dual_modal:
+                frames_ir, time_idx_ir, _ = decoder.decode(
+                    video_container_ir,
+                    sampling_rate,
+                    ir_num_frames,
+                    temporal_sample_index,
+                    self.cfg.TEST.NUM_ENSEMBLE_VIEWS,
+                    video_meta=self._video_meta_ir[index]
+                    if len(self._video_meta_ir) < 5e6
+                    else {},
+                    target_fps=target_fps,
+                    backend=self.cfg.DATA.DECODING_BACKEND,
+                    use_offset=self.cfg.DATA.USE_OFFSET_SAMPLING,
+                    max_spatial_scale=min_scale[0]
+                    if all(x == min_scale[0] for x in min_scale)
+                    else 0,
+                    time_diff_prob=self.p_convert_dt
+                    if self.mode in ["train"]
+                    else 0.0,
+                    temporally_rnd_clips=True,
+                    min_delta=self.cfg.CONTRASTIVE.DELTA_CLIPS_MIN,
+                    max_delta=self.cfg.CONTRASTIVE.DELTA_CLIPS_MAX,
+                )
+                frames_ir_decoded = frames_ir
+
             # If decoding failed (wrong format, video is too short, and etc),
             # select another video.
             if frames_decoded is None or None in frames_decoded:
@@ -406,6 +612,19 @@ class Kinetics(torch.utils.data.Dataset):
                     index = random.randint(0, len(self._path_to_videos) - 1)
                 continue
 
+            if self.dual_modal and (frames_ir_decoded is None or None in frames_ir_decoded):
+                logger.warning(
+                    "Failed to decode infrared video idx {} from {}; trial {}".format(
+                        index, self._path_to_videos_ir[index], i_try
+                    )
+                )
+                if (
+                    self.mode not in ["test", "test_openset"]
+                    and (i_try % (self._num_retries // 8)) == 0
+                ):
+                    index = random.randint(0, len(self._path_to_videos) - 1)
+                continue
+
             num_aug = (
                 self.cfg.DATA.TRAIN_CROP_NUM_SPATIAL * self.cfg.AUG.NUM_SAMPLE
                 if self.mode in ["train"]
@@ -419,47 +638,62 @@ class Kinetics(torch.utils.data.Dataset):
             for i in range(num_decode):
                 for _ in range(num_aug):
                     idx += 1
-                    f_out[idx] = frames_decoded[i].clone()
+                    modal_frames = OrderedDict()
+                    modal_frames["rgb"] = frames_decoded[i].clone()
+                    if self.dual_modal:
+                        modal_frames["ir"] = frames_ir_decoded[i].clone()
                     time_idx_out[idx] = time_idx_decoded[i, :]
 
-                    f_out[idx] = f_out[idx].float()
-                    f_out[idx] = f_out[idx] / 255.0
+                    # 归一化到 [0,1]
+                    for key in modal_frames:
+                        modal_frames[key] = modal_frames[key].float()
+                        modal_frames[key] = modal_frames[key] / 255.0
 
+                    # 颜色抖动：RGB 和 IR 共享同一组随机参数
                     if (
                         self.mode in ["train"]
                         and self.cfg.DATA.SSL_COLOR_JITTER
                     ):
-                        f_out[idx] = transform.color_jitter_video_ssl(
-                            f_out[idx],
-                            bri_con_sat=self.cfg.DATA.SSL_COLOR_BRI_CON_SAT,
-                            hue=self.cfg.DATA.SSL_COLOR_HUE,
-                            p_convert_gray=self.p_convert_gray,
-                            moco_v2_aug=self.cfg.DATA.SSL_MOCOV2_AUG,
-                            gaussan_sigma_min=self.cfg.DATA.SSL_BLUR_SIGMA_MIN,
-                            gaussan_sigma_max=self.cfg.DATA.SSL_BLUR_SIGMA_MAX,
+                        def _color_jitter(frames):
+                            return transform.color_jitter_video_ssl(
+                                frames,
+                                bri_con_sat=self.cfg.DATA.SSL_COLOR_BRI_CON_SAT,
+                                hue=self.cfg.DATA.SSL_COLOR_HUE,
+                                p_convert_gray=self.p_convert_gray,
+                                moco_v2_aug=self.cfg.DATA.SSL_MOCOV2_AUG,
+                                gaussan_sigma_min=self.cfg.DATA.SSL_BLUR_SIGMA_MIN,
+                                gaussan_sigma_max=self.cfg.DATA.SSL_BLUR_SIGMA_MAX,
+                            )
+
+                        modal_frames = self._apply_shared_random(
+                            modal_frames, _color_jitter
                         )
 
+                    # RandAugment：共享随机参数
                     if self.aug and self.cfg.AUG.AA_TYPE:
                         aug_transform = create_random_augment(
-                            input_size=(f_out[idx].size(1), f_out[idx].size(2)),
+                            input_size=(
+                                next(iter(modal_frames.values())).size(1),
+                                next(iter(modal_frames.values())).size(2),
+                            ),
                             auto_augment=self.cfg.AUG.AA_TYPE,
                             interpolation=self.cfg.AUG.INTERPOLATION,
                         )
-                        # T H W C -> T C H W.
-                        f_out[idx] = f_out[idx].permute(0, 3, 1, 2)
-                        list_img = self._frame_to_list_img(f_out[idx])
-                        list_img = aug_transform(list_img)
-                        f_out[idx] = self._list_img_to_frames(list_img)
-                        f_out[idx] = f_out[idx].permute(0, 2, 3, 1)
 
-                    # Perform color normalization.
-                    f_out[idx] = utils.tensor_normalize(
-                        f_out[idx], self.cfg.DATA.MEAN, self.cfg.DATA.STD
-                    )
+                        def _auto_augment(frames):
+                            # T H W C -> T C H W.
+                            frames = frames.permute(0, 3, 1, 2)
+                            list_img = self._frame_to_list_img(frames)
+                            list_img = aug_transform(list_img)
+                            frames = self._list_img_to_frames(list_img)
+                            # T C H W -> T H W C
+                            return frames.permute(0, 2, 3, 1)
 
-                    # T H W C -> C T H W.
-                    f_out[idx] = f_out[idx].permute(3, 0, 1, 2)
+                        modal_frames = self._apply_shared_random(
+                            modal_frames, _auto_augment
+                        )
 
+                    # 颜色归一化 + 维度变换：T H W C -> C T H W
                     scl, asp = (
                         self.cfg.DATA.TRAIN_JITTER_SCALES_RELATIVE,
                         self.cfg.DATA.TRAIN_JITTER_ASPECT_RELATIVE,
@@ -474,21 +708,53 @@ class Kinetics(torch.utils.data.Dataset):
                         if (self.mode not in ["train"] or len(asp) == 0)
                         else asp
                     )
-                    f_out[idx] = utils.spatial_sampling(
-                        f_out[idx],
-                        spatial_idx=spatial_sample_index,
-                        min_scale=min_scale[i],
-                        max_scale=max_scale[i],
-                        crop_size=crop_size[i],
-                        random_horizontal_flip=self.cfg.DATA.RANDOM_FLIP,
-                        inverse_uniform_sampling=self.cfg.DATA.INV_UNIFORM_SAMPLE,
-                        aspect_ratio=relative_aspect,
-                        scale=relative_scales,
-                        motion_shift=self.cfg.DATA.TRAIN_JITTER_MOTION_SHIFT
-                        if self.mode in ["train"]
-                        else False,
+
+                    for key in modal_frames:
+                        if key != "rgb" and self.dual_modal:
+                            mean = (
+                                self.cfg.DATA.MEAN_IR
+                                if len(self.cfg.DATA.MEAN_IR)
+                                else self.cfg.DATA.MEAN
+                            )
+                            std = (
+                                self.cfg.DATA.STD_IR
+                                if len(self.cfg.DATA.STD_IR)
+                                else self.cfg.DATA.STD
+                            )
+                        else:
+                            mean = self.cfg.DATA.MEAN
+                            std = self.cfg.DATA.STD
+
+                        modal_frames[key] = utils.tensor_normalize(
+                            modal_frames[key], mean, std
+                        )
+                        modal_frames[key] = modal_frames[key].permute(3, 0, 1, 2)
+
+                    # 空间采样：共享随机参数
+                    def _spatial(frames):
+                        return utils.spatial_sampling(
+                            frames,
+                            spatial_idx=spatial_sample_index,
+                            min_scale=min_scale[i],
+                            max_scale=max_scale[i],
+                            crop_size=crop_size[i],
+                            random_horizontal_flip=self.cfg.DATA.RANDOM_FLIP,
+                            inverse_uniform_sampling=self.cfg.DATA.INV_UNIFORM_SAMPLE,
+                            aspect_ratio=relative_aspect,
+                            scale=relative_scales,
+                            motion_shift=self.cfg.DATA.TRAIN_JITTER_MOTION_SHIFT
+                            if self.mode in ["train"]
+                            else False,
+                        )
+
+                    modal_frames = self._apply_shared_random(
+                        modal_frames, _spatial
                     )
 
+                    # 对齐 RGB/IR clip 长度
+                    modal_frames = self._match_clip_lengths(modal_frames)
+
+                    # 随机擦除：共享随机参数
                     if self.rand_erase:
                         erase_transform = RandomErasing(
                             self.cfg.AUG.RE_PROB,
@@ -497,14 +763,39 @@ class Kinetics(torch.utils.data.Dataset):
                             num_splits=self.cfg.AUG.RE_COUNT,
                             device="cpu",
                         )
-                        f_out[idx] = erase_transform(
-                            f_out[idx].permute(1, 0, 2, 3)
-                        ).permute(1, 0, 2, 3)
 
-                    f_out[idx] = utils.pack_pathway_output(self.cfg, f_out[idx])
+                        def _erase(frames):
+                            return erase_transform(
+                                frames.permute(1, 0, 2, 3)
+                            ).permute(1, 0, 2, 3)
+
+                        modal_frames = self._apply_shared_random(
+                            modal_frames, _erase
+                        )
+
+                    # 打包输出：单模态 / 双模态
+                    if self.dual_modal:
+                        rgb_frames = modal_frames["rgb"]
+                        ir_frames = modal_frames["ir"]
+                        f_out[idx] = utils.pack_pathway_output(
+                            self.cfg, (rgb_frames, ir_frames)
+                        )
+                    else:
+                        f_out[idx] = utils.pack_pathway_output(
+                            self.cfg, next(iter(modal_frames.values()))
+                        )
+
                     if self.cfg.AUG.GEN_MASK_LOADER:
                         mask = self._gen_mask()
                         f_out[idx] = f_out[idx] + [torch.Tensor(), mask]
+
+            sample_index = index
+            extra_info = {}
+            if self.cfg.DATA.RETURN_VIDEO_PATHS:
+                extra_info["rgb_path"] = self._path_to_videos[sample_index]
+                if self.dual_modal:
+                    extra_info["ir_path"] = self._path_to_videos_ir[sample_index]
+
             frames = f_out[0] if num_out == 1 else f_out
             time_idx = np.array(time_idx_out)
             if (
@@ -516,7 +807,7 @@ class Kinetics(torch.utils.data.Dataset):
             if self.cfg.DATA.DUMMY_LOAD:
                 if self.dummy_output is None:
                     self.dummy_output = (frames, label, index, time_idx, {})
-            return frames, label, index, time_idx, {}
+            return frames, label, index, time_idx, extra_info if extra_info else {}
         else:
             logger.warning("!!!!!!!!!!!!!!!")
             logger.warning(self._path_to_videos[index])
@@ -564,6 +855,62 @@ class Kinetics(torch.utils.data.Dataset):
             mask = masked_position_generator()
         return mask
 
+    def _apply_shared_random(self, modal_frames, func):
+        """
+        Apply a stochastic transform to every modality using identical random
+        parameters. The RNG state after applying the transform matches the
+        single-modality case so subsequent operations remain reproducible.
+        """
+
+        if len(modal_frames) <= 1:
+            for key in modal_frames:
+                modal_frames[key] = func(modal_frames[key])
+            return modal_frames
+
+        keys = list(modal_frames.keys())
+        torch_state_before = torch.random.get_rng_state()
+        np_state_before = np.random.get_state()
+        random_state_before = random.getstate()
+
+        # 先在第一个模态上跑一遍，生成/消耗随机数
+        modal_frames[keys[0]] = func(modal_frames[keys[0]])
+
+        torch_state_after = torch.random.get_rng_state()
+        np_state_after = np.random.get_state()
+        random_state_after = random.getstate()
+
+        # 其余模态恢复到同一 RNG 起点，再执行 transform
+        for key in keys[1:]:
+            torch.random.set_rng_state(torch_state_before)
+            np.random.set_state(np_state_before)
+            random.setstate(random_state_before)
+            modal_frames[key] = func(modal_frames[key])
+
+        # 最后恢复 RNG 到“单模态情况下”的状态
+        torch.random.set_rng_state(torch_state_after)
+        np.random.set_state(np_state_after)
+        random.setstate(random_state_after)
+        return modal_frames
+
+    def _match_clip_lengths(self, modal_frames):
+        """Ensure all modalities share the same temporal dimension."""
+        if len(modal_frames) <= 1:
+            return modal_frames
+
+        # 统一到第一个模态的 T
+        target_len = next(iter(modal_frames.values())).shape[1]
+        for key, frames in modal_frames.items():
+            if frames.shape[1] == target_len:
+                continue
+            resized = F.interpolate(
+                frames.unsqueeze(0),
+                size=(target_len, frames.shape[2], frames.shape[3]),
+                mode="trilinear",
+                align_corners=False,
+            )
+            modal_frames[key] = resized.squeeze(0)
+        return modal_frames
+
     def _frame_to_list_img(self, frames):
         img_list = [
             transforms.ToPILImage()(frames[i]) for i in range(frames.size(0))
@@ -588,3 +935,40 @@ class Kinetics(torch.utils.data.Dataset):
             (int): the number of videos in the dataset.
         """
         return len(self._path_to_videos)
+
+    def _verify_dual_modal_pairs(self):
+        """Validate that RGB/IR samples stay paired throughout iteration."""
+
+        if len(self._path_to_videos) != len(self._path_to_videos_ir):
+            raise RuntimeError(
+                f"RGB and infrared clip counts differ ({len(self._path_to_videos)} vs "
+                f"{len(self._path_to_videos_ir)}). Ensure each row in {self.mode} lists"
+                " both modalities."
+            )
+
+        first_missing = None
+        for idx, (rgb_path, ir_path) in enumerate(
+            zip(self._path_to_videos, self._path_to_videos_ir)
+        ):
+            if rgb_path is None or ir_path is None:
+                first_missing = (idx, rgb_path, ir_path)
+                break
+            if not pathmgr.exists(rgb_path):
+                first_missing = (idx, rgb_path, ir_path)
+                break
+            if not pathmgr.exists(ir_path):
+                first_missing = (idx, rgb_path, ir_path)
+                break
+
+        if first_missing is not None:
+            idx, rgb_path, ir_path = first_missing
+            raise RuntimeError(
+                "Dual-modal sample {} is incomplete (rgb={}, ir={}). Check the"
+                " CSV annotations for split {}.".format(idx, rgb_path, ir_path, self.mode)
+            )
+
+        logger.info(
+            "Verified {} paired RGB/IR clips for {} split.".format(
+                len(self._path_to_videos), self.mode
+            )
+        )
