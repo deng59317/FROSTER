@@ -18,6 +18,9 @@ _C = CfgNode()
 _C.TRAIN_FILE = ""
 _C.VAL_FILE = ""
 _C.TEST_FILE = ""
+_C.TRAIN_FILE_IR = ""
+_C.VAL_FILE_IR = ""
+_C.TEST_FILE_IR = ""
 
 # -----------------------------------------------------------------------------
 # Contrastive Model (for MoCo, SimCLR, SwAV, BYOL)
@@ -664,6 +667,10 @@ _C.DATA = CfgNode()
 # The path to the data directory.
 _C.DATA.PATH_TO_DATA_DIR = ""
 
+# Optional second annotation directory for dual-modality datasets. When left
+# empty, DATA.PATH_TO_DATA_DIR is reused for both modalities.
+_C.DATA.PATH_TO_DATA_DIR_IR = ""
+
 # The separator used between path and label.
 _C.DATA.PATH_LABEL_SEPARATOR = " "
 
@@ -672,6 +679,13 @@ _C.DATA.PATH_PREFIX = ""
 
 # The number of frames of the input clip.
 _C.DATA.NUM_FRAMES = 8
+
+# Optional number of frames for a secondary video modality. When set to a
+# non-positive value, the primary NUM_FRAMES setting is used.
+_C.DATA.NUM_FRAMES_IR = 0
+_C.DATA.VERIFY_DUAL_MODAL_PAIRS = True
+_C.DATA.RETURN_VIDEO_PATHS = False
+_C.DATA.MATCH_DUAL_MODAL_BY_ORDER = False
 
 # The video sampling rate of the input clip.
 _C.DATA.SAMPLING_RATE = 8
@@ -693,12 +707,24 @@ _C.DATA.PATH_TO_PRELOAD_IMDB = ""
 
 # The mean value of the video raw pixels across the R G B channels.
 _C.DATA.MEAN = [0.45, 0.45, 0.45]
+# Optional mean value for a secondary video modality (e.g. infrared).
+_C.DATA.MEAN_IR = []
 # List of input frame channel dimensions.
 
 _C.DATA.INPUT_CHANNEL_NUM = [3, 3]
 
 # The std value of the video raw pixels across the R G B channels.
 _C.DATA.STD = [0.225, 0.225, 0.225]
+# Optional std value for a secondary video modality (e.g. infrared).
+_C.DATA.STD_IR = []
+
+# Type of video modalities to load. Default "rgb" keeps the historical
+# single-stream behaviour, while "rgb_ir" expects paired visible/infrared
+# videos per sample.
+_C.DATA.MODALITY = "rgb"
+
+# Video path prefix for the secondary modality when DATA.MODALITY != "rgb".
+_C.DATA.PATH_PREFIX_IR = ""
 
 # The spatial augmentation jitter scales for training.
 _C.DATA.TRAIN_JITTER_SCALES = [256, 320]
