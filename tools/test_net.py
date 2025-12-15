@@ -18,7 +18,6 @@ from slowfast.datasets import loader
 from slowfast.models import build_model
 from slowfast.utils.env import pathmgr
 from slowfast.utils.meters import AVAMeter, TestMeter
-from slowfast.utils.env import pathmgr
 
 logger = logging.get_logger(__name__)
 
@@ -126,32 +125,42 @@ def perform_test(test_loader, model, test_meter, cfg, writer=None):
 
             # Perform the forward pass.
             if cfg.MODEL.RECORD_ROUTING:
-                preds, routing_state = model(inputs)
-                # routing_state shape [layer_num, patch_num, bz * clip_len, 2)
-                rshape = routing_state.shape
-                routing_state = routing_state.reshape(rshape[0], rshape[1], inputs[0].shape[0], -1, 2).permute(2, 0, 1, 3, 4)
-                if get_local_rank() == 0:
-                    if cur_iter % 10 == 0:
-                        print(routing_state[:,:,:,:,0].mean(-1).mean(0).detach().cpu().squeeze().numpy())
+                model_output = model(inputs)
+                if isinstance(model_output, tuple) and len(model_output) == 2:
+                    preds, routing_state = model_output
+                    # routing_state shape [layer_num, patch_num, bz * clip_len, 2)
+                    rshape = routing_state.shape
+                    routing_state = routing_state.reshape(rshape[0], rshape[1], inputs[0].shape[0], -1, 2).permute(2, 0, 1, 3, 4)
+                    if get_local_rank() == 0:
+                        if cur_iter % 10 == 0:
+                            print(routing_state[:,:,:,:,0].mean(-1).mean(0).detach().cpu().squeeze().numpy())
+                else:
+                    # 如果返回的不是元组，可能是旧格式
+                    preds = model_output
             
             elif cfg.MODEL.KEEP_RAW_MODEL and cfg.MODEL.ENSEMBLE_PRED:
-                preds, raw_preds = model(inputs)
-                preds = cfg.MODEL.ENSEMBLE_RAWMODEL_RATIO * raw_preds + (1 - cfg.MODEL.ENSEMBLE_RAWMODEL_RATIO) * preds
+                model_output = model(inputs)
+                if isinstance(model_output, tuple) and len(model_output) == 2:
+                    preds, raw_preds = model_output
+                    preds = cfg.MODEL.ENSEMBLE_RAWMODEL_RATIO * raw_preds + (1 - cfg.MODEL.ENSEMBLE_RAWMODEL_RATIO) * preds
+                else:
+                    preds = model_output
 
             else:
                 preds = model(inputs)
+            
+            # 统一处理preds的格式：如果是列表或元组，取第一个元素（分类结果）
+            if isinstance(preds, (list, tuple)):
+                preds = preds[0]  # 取分类结果
+
         # Gather all the predictions across all the devices to perform ensemble.
         if cfg.NUM_GPUS > 1:
             preds, labels, video_idx = du.all_gather([preds, labels, video_idx])
-            """
-            if cfg.MODEL.RECORD_ROUTING:
-                routing_state = du.all_gather([routing_state])[0]
-                routing_state = routing_state.cpu()
-                rout_list.append(routing_state)
-            """
-            # if cfg.MODEL.RECORD_ROUTING and cur_iter >= 10:
-            #     break
 
+        # 确保preds是张量而不是列表 - 在调用.cpu()之前检查
+        if isinstance(preds, (list, tuple)):
+            preds = preds[0]  # 取分类结果
+        
         if cfg.NUM_GPUS:
             preds = preds.cpu()
             labels = labels.cpu()
@@ -167,14 +176,6 @@ def perform_test(test_loader, model, test_meter, cfg, writer=None):
         test_meter.log_iter_stats(cur_iter) 
         test_meter.iter_tic()
     
-    # routing record verify
-    """
-    if cfg.MODEL.RECORD_ROUTING:
-        if get_local_rank() == 0: 
-            rout_record = torch.cat(rout_list, 0)
-            torch.save(rout_record, "%s/%s_rout_record.pth"%(cfg.OUTPUT_DIR, cfg.DATA.PATH_TO_DATA_DIR.split('/')[-1]))
-    """ 
-
     # Log epoch stats and print the final testing results.
     if not cfg.DETECTION.ENABLE:
         all_preds = test_meter.video_preds.clone().detach()
@@ -196,60 +197,11 @@ def perform_test(test_loader, model, test_meter, cfg, writer=None):
                 "Successfully saved prediction results to {}".format(save_path)
             )
 
-        if False:
-            all_preds = test_meter.video_preds.clone().detach()
-            all_labels = test_meter.video_labels
-            accumulate = {}
-            for idx in range(len(all_labels)):
-                label = int(all_labels[idx])
-                if label not in accumulate:
-                    accumulate[label] = []
-                if torch.argmax(all_preds[idx], 0) == label:
-                    accumulate[label].append(1)
-                else:
-                    accumulate[label].append(0)
-            
-            # find the half most classes
-            name = os.path.join(cfg.DATA.PATH_TO_DATA_DIR, 'train.csv')
-            cls_freq = {}
-            with open(name, 'r') as f:
-                lines = f.readlines()
-                for line in lines:
-                    cls = int(line.split(",")[1])
-                    if cls not in cls_freq:
-                        cls_freq[cls] = 0
-                    cls_freq[cls] += 1
-
-            cls_freq_list = []
-            for cls_id in range(len(cls_freq)):
-                cls_freq_list.append((cls_id,cls_freq[cls_id]))
-            cls_freq_list = sorted(cls_freq_list, key = lambda x:x[1], reverse=True)
-            closeset = [i[0] for i in cls_freq_list[:200]]
-            openset = [i[0] for i in cls_freq_list[200:]]
-             
-            print(len(accumulate))
-            print(len(closeset))
-            print(len(openset))
-
-            closeset_acc = []
-            openset_acc = []
-            for label in closeset:
-                closeset_acc += accumulate[label]
-            for label in openset:
-                openset_acc += accumulate[label]
-
-            openset_acc = sum(openset_acc) / len(openset_acc)
-            closeset_acc = sum(closeset_acc) / len(closeset_acc)
-            
-            print('top-1 closeset acc: %f'%(closeset_acc))
-            print('top-1 openset acc: %f'%(openset_acc))
-
     test_meter.finalize_metrics()
     return test_meter
 
 
 def test(cfg):
-
     """
     Perform multi-view testing on the pretrained video model.
     Args:
