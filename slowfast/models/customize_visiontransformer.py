@@ -742,7 +742,22 @@ class TemporalVisionTransformer(nn.Module):
 
         cls_token = self.class_embedding.to(x.dtype) + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device)
         x = torch.cat([cls_token, x], dim=1)  # shape = [*, grid ** 2 + 1, width]
-        x = x + self.positional_embedding.to(x.dtype)
+        
+        # 修复位置编码维度匹配问题
+        pos_embed = self.positional_embedding.to(x.dtype)
+        if x.shape[1] != pos_embed.shape[0]:
+            # 动态调整位置编码维度
+            if x.shape[1] > pos_embed.shape[0]:
+                # 扩展位置编码
+                new_pos_embed = torch.zeros(x.shape[1], pos_embed.shape[1], 
+                                           dtype=x.dtype, device=x.device)
+                new_pos_embed[:pos_embed.shape[0], :] = pos_embed
+                pos_embed = new_pos_embed
+            else:
+                # 截断位置编码
+                pos_embed = pos_embed[:x.shape[1], :]
+        x = x + pos_embed
+        
         x = self.ln_pre(x)
 
         x = x.permute(1, 0, 2)  # NLD -> LND
