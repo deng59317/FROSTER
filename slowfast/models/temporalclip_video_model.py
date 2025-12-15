@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from . import clip
 import random
 from .build import MODEL_REGISTRY
@@ -45,7 +46,8 @@ class TemporalClipVideo(nn.Module):
         """
         super(TemporalClipVideo, self).__init__()
         self.cfg = cfg
-        self.num_pathways = 1
+        self.dual_modal = cfg.DATA.MODALITY == "rgb_ir"
+        self.num_pathways = 2 if self.dual_modal else 1
         
         self._construct_network(cfg)
         self.model.eval()
@@ -206,28 +208,73 @@ class TemporalClipVideo(nn.Module):
         # shape of x(input) is (bz, channel, clip_len, h, w)
 
         assert len(x) == self.num_pathways
-        x = x[0]
-        if len(x.shape) == 4:
-            # image input
-            x = x.unsqueeze(2)
+        prepared_inputs = []
+        bz, clip_len = None, None
+        for pathway_idx in range(self.num_pathways):
+            video = x[pathway_idx]
+            if len(video.shape) == 4:
+                video = video.unsqueeze(2)
+
+            cur_bz, channel_dim, cur_clip_len, h, w = video.shape
+            if bz is None:
+                bz, clip_len = cur_bz, cur_clip_len
+            else:
+                assert cur_bz == bz
+                if cur_clip_len != clip_len:
+                    video = F.interpolate(
+                        video,
+                        size=(clip_len, h, w),
+                        mode="trilinear",
+                        align_corners=False,
+                    )
+                cur_clip_len = clip_len
+                channel_dim = video.shape[1]
+                h, w = video.shape[3], video.shape[4]
+
+            video = video.permute(0, 2, 1, 3, 4)
+            video = video.reshape(cur_bz * cur_clip_len, channel_dim, h, w)
+
+            if self.dual_modal and pathway_idx == 1 and video.shape[1] == 1:
+                video = video.repeat(1, 3, 1, 1)
+
+            prepared_inputs.append(video)
         
         # ensure eval state all the time, cost time ?
         if self.keep_raw_model:
             self.raw_model.eval()
 
-        bz, channel_dim, clip_len, h, w = x.shape
-        x = x.permute(0, 2, 1, 3, 4)
-        x = x.reshape(bz*clip_len, channel_dim, h, w)
-        
-        if self.record_routing:
-            img_encode, routing_state = self.model.encode_image(x)
+        img_encode_list = []
+        feature_list = []
+        routing_state = None
+
+        for pathway_idx, video in enumerate(prepared_inputs):
+            if self.record_routing:
+                enc_out, cur_routing_state = self.model.encode_image(video)
+            else:
+                enc_out = self.model.encode_image(video)
+                cur_routing_state = None
+
+            feature = None
+            if isinstance(enc_out, list):
+                enc_out, feature = enc_out
+
+            img_encode_list.append(enc_out)
+            feature_list.append(feature)
+            if pathway_idx == 0:
+                routing_state = cur_routing_state
+
+        if len(img_encode_list) > 1:
+            img_encode = torch.stack(img_encode_list, dim=0).mean(dim=0)
         else:
-            img_encode = self.model.encode_image(x)
+            img_encode = img_encode_list[0]
             
         feature = None
-        if isinstance(img_encode, list):
-            img_encode, feature = img_encode
-            c = feature.shape[-1]
+        valid_features = [feat for feat in feature_list if feat is not None]
+        if valid_features:
+            if len(valid_features) > 1:
+                feature = torch.stack(valid_features, dim=0).mean(dim=0)
+            else:
+                feature = valid_features[0]
 
         if self.training:
             # img encode [bz, feat_size]
@@ -260,9 +307,18 @@ class TemporalClipVideo(nn.Module):
             if self.keep_raw_model and (self.ensemble_pred or self.distillation):
                 # pass
                 with torch.no_grad():
-                    raw_img_encode = self.raw_model.encode_image(x)
-                    if isinstance(raw_img_encode, list):
-                        raw_img_encode = raw_img_encode[0]
+                    raw_img_encode_list = []
+                    for video in prepared_inputs:
+                        raw_out = self.raw_model.encode_image(video)
+                        if isinstance(raw_out, list):
+                            raw_out = raw_out[0]
+                        raw_img_encode_list.append(raw_out)
+                    if len(raw_img_encode_list) > 1:
+                        raw_img_encode = torch.stack(
+                            raw_img_encode_list, dim=0
+                        ).mean(dim=0)
+                    else:
+                        raw_img_encode = raw_img_encode_list[0]
                     raw_img_encode /= raw_img_encode.norm(dim=-1, keepdim=True)
                     # raw_pred = self.raw_model.logit_scale.exp() * raw_img_encode @ self.dynamic_classifier_raw.T
                     # raw_pred = raw_pred.reshape(bz, clip_len, -1).mean(1)
